@@ -1,5 +1,5 @@
-import { useEffect, useMemo } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { LayersControl, MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet'
 
 type MarkerItem = {
   id: string
@@ -21,6 +21,40 @@ function FitToMarkers({ markers }: { markers: MarkerItem[] }) {
   return null
 }
 
+function LocateControl() {
+  const map = useMap()
+  const [busy, setBusy] = useState(false)
+
+  const onClick = useCallback(() => {
+    if (!navigator.geolocation) return
+    setBusy(true)
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setBusy(false)
+        const { latitude, longitude } = pos.coords
+        map.flyTo([latitude, longitude], Math.max(map.getZoom(), 15), { animate: true, duration: 0.7 })
+      },
+      () => {
+        setBusy(false)
+      },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 10_000 },
+    )
+  }, [map])
+
+  return (
+    <div className="absolute left-3 top-3 z-[1000]">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy || !navigator.geolocation}
+        className="rounded-lg border border-slate-800/60 bg-slate-950/80 px-3 py-2 text-xs text-slate-100 shadow backdrop-blur transition hover:bg-slate-950 disabled:opacity-60"
+      >
+        {busy ? '定位中…' : '定位'}
+      </button>
+    </div>
+  )
+}
+
 export function LeafletPositionsMap({ markers, className }: { markers: MarkerItem[]; className?: string }) {
   const center = useMemo(() => {
     const first = markers[0]
@@ -30,12 +64,29 @@ export function LeafletPositionsMap({ markers, className }: { markers: MarkerIte
 
   return (
     <div className={className}>
-      <MapContainer center={center} zoom={markers.length ? 13 : 12} className="h-full w-full">
-        <TileLayer
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        />
+      <MapContainer center={center} zoom={markers.length ? 13 : 12} className="h-full w-full" zoomControl={false}>
+        <LayersControl position="topright">
+          <LayersControl.BaseLayer checked name="OpenStreetMap">
+            <TileLayer
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            />
+          </LayersControl.BaseLayer>
+          <LayersControl.BaseLayer name="Carto Light">
+            <TileLayer
+              url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+            />
+          </LayersControl.BaseLayer>
+          <LayersControl.BaseLayer name="Carto Dark">
+            <TileLayer
+              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+            />
+          </LayersControl.BaseLayer>
+        </LayersControl>
         <FitToMarkers markers={markers} />
+        <LocateControl />
         {markers.map((m) => (
           <CircleMarker
             key={m.id}
