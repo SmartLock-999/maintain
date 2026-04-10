@@ -1,17 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Server, Users, Wifi } from 'lucide-react'
-import type { MqttClient } from 'mqtt'
 import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
 import { Button } from '@/components/ui/Button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card'
-import { Modal } from '@/components/ui/Modal'
 import { Select } from '@/components/ui/Select'
 import { StatusBadge } from '@/components/ui/StatusBadge'
 import { useAuthStore } from '@/stores/authStore'
 import { supabase } from '@/utils/supabase'
 import { formatTs } from '@/utils/time'
-import { GooglePositionsMap } from '@/components/maps/GooglePositionsMap'
+import { LeafletPositionsMap } from '@/components/maps/LeafletPositionsMap'
 
 type RegisteredEmailRow = {
   email: string
@@ -83,6 +81,7 @@ export default function DashboardPage() {
   const envMissing = useAuthStore((s) => s.envMissing)
   const [serverOk, setServerOk] = useState<boolean | null>(null)
   const [serverErr, setServerErr] = useState<string | null>(null)
+  const [refreshNonce, setRefreshNonce] = useState(0)
 
   const [mqttList, setMqttList] = useState<MqttListRow[]>([])
   const [registered, setRegistered] = useState<RegisteredEmailRow[]>([])
@@ -91,12 +90,12 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
-  const [accountFilter, setAccountFilter] = useState<string>('all')
-  const [devicesModalOpen, setDevicesModalOpen] = useState(false)
-  const [devicesModalUserId, setDevicesModalUserId] = useState<string | null>(null)
+  const [selectedAccount, setSelectedAccount] = useState<string>('all')
 
-  const mqttClientsRef = useRef<Record<string, MqttClient | null>>({})
+  const connectivityRunRef = useRef(0)
+  const connectivityRunningRef = useRef(false)
   const [mqttStatusByDeviceId, setMqttStatusByDeviceId] = useState<Record<string, string>>({})
+  const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, boolean | null>>({})
 
   const mqttMap = useMemo(() => {
     const m: Record<number, string> = {}
@@ -127,9 +126,8 @@ export default function DashboardPage() {
   }, [deviceCreds])
 
   const positionsMarkers = useMemo(() => {
-    const apiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined)?.trim() || null
-    const filtered = accountFilter === 'all' ? positions : positions.filter((p) => String(p.user_id) === accountFilter)
-    const markers = filtered
+    const filtered = selectedAccount === 'all' ? positions : positions.filter((p) => String(p.user_id) === selectedAccount)
+    return filtered
       .map((p) => {
         const lat = asNumber(p.lat)
         const lng = asNumber(p.lng)
@@ -144,8 +142,7 @@ export default function DashboardPage() {
         }
       })
       .filter(Boolean) as { id: string; lat: number; lng: number; title?: string; subtitle?: string }[]
-    return { apiKey, markers }
-  }, [accountFilter, positions])
+  }, [positions, selectedAccount])
 
   useEffect(() => {
     if (envMissing.length) {
@@ -218,72 +215,161 @@ export default function DashboardPage() {
       cancelled = true
       window.clearInterval(t)
     }
-  }, [envMissing.length])
+  }, [envMissing.length, refreshNonce])
 
-  const onOpenDevicesModal = (userId: string) => {
-    setDevicesModalUserId(userId)
-    setDevicesModalOpen(true)
-  }
+  const selectedDevices = useMemo(() => {
+    if (selectedAccount === 'all') return deviceCreds
+    return deviceCreds.filter((d) => String(d.user_id) === selectedAccount)
+  }, [deviceCreds, selectedAccount])
 
-  const modalDevices = useMemo(() => {
-    if (!devicesModalUserId) return []
-    return deviceCreds.filter((d) => String(d.user_id) === devicesModalUserId)
-  }, [deviceCreds, devicesModalUserId])
+  const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
-  const brokerUrlFor = (d: DeviceCredentialRow): string | null => {
-    const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
-    const raw = mqttMap[no]
-    if (!raw) return null
-    return normalizeBrokerUrl(raw)
-  }
+  const mqttServerStatus = useMemo(() => {
+    const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
+    for (const row of mqttListVisible) map[row.server_no] = 'Unknown'
 
-  const stopDeviceClient = (deviceId: string) => {
-    const current = mqttClientsRef.current[deviceId]
-    if (current) {
-      try {
-        current.end(true)
-      } catch {
-        void 0
-      }
+    for (const d of deviceCreds) {
+      const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
+      if (!(no in map)) continue
+      const deviceOnline = deviceOnlineByDeviceId[d.id]
+      if (deviceOnline === true) map[no] = 'Online'
+      else if (deviceOnline === false && map[no] !== 'Online') map[no] = 'Offline'
     }
-    mqttClientsRef.current[deviceId] = null
-    setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Disconnected' }))
-  }
-
-  const testDeviceMqtt = (d: DeviceCredentialRow) => {
-    const deviceId = d.id
-    stopDeviceClient(deviceId)
-    const url = brokerUrlFor(d)
-    if (!url) {
-      setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoServerUrl' }))
-      return
-    }
-    if (!d.mqtt_user || !d.mqtt_pass) {
-      setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoCredentials' }))
-      return
-    }
-
-    setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Connecting...' }))
-    const client = mqtt.connect(url, {
-      username: d.mqtt_user,
-      password: d.mqtt_pass,
-      reconnectPeriod: 3000,
-      keepalive: 30,
-      clean: true,
-    })
-
-    mqttClientsRef.current[deviceId] = client
-    client.on('connect', () => setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Connected' })))
-    client.on('reconnect', () => setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Connecting...' })))
-    client.on('close', () => setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Disconnected' })))
-    client.on('error', () => setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Error' })))
-  }
+    return map
+  }, [deviceCreds, deviceOnlineByDeviceId, mqttListVisible])
 
   useEffect(() => {
-    if (!devicesModalOpen) {
-      for (const id of Object.keys(mqttClientsRef.current)) stopDeviceClient(id)
+    setDeviceOnlineByDeviceId({})
+  }, [selectedAccount])
+
+  useEffect(() => {
+    if (envMissing.length) return
+    if (!deviceCreds.length) return
+
+    const maxConcurrency = 6
+    const connectTimeoutMs = 8000
+    const intervalMs = 60_000
+
+    let cancelled = false
+
+    const checkOne = (d: DeviceCredentialRow, runId: number) =>
+      new Promise<void>((resolve) => {
+        if (cancelled) return resolve()
+        const deviceId = d.id
+        setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: null }))
+
+        const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
+        const raw = mqttMap[no]
+        const url = raw ? normalizeBrokerUrl(raw) : null
+        if (!url || !raw?.trim()) {
+          setMqttStatusByDeviceId((prev) => (prev[deviceId] === 'NoServerUrl' ? prev : { ...prev, [deviceId]: 'NoServerUrl' }))
+          return resolve()
+        }
+        if (!d.mqtt_user || !d.mqtt_pass) {
+          setMqttStatusByDeviceId((prev) => (prev[deviceId] === 'NoCredentials' ? prev : { ...prev, [deviceId]: 'NoCredentials' }))
+          return resolve()
+        }
+        if (!d.device_name) {
+          setMqttStatusByDeviceId((prev) => (prev[deviceId] === 'NoTopic' ? prev : { ...prev, [deviceId]: 'NoTopic' }))
+          return resolve()
+        }
+
+        setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Connecting...' }))
+        const client = mqtt.connect(url, {
+          username: d.mqtt_user,
+          password: d.mqtt_pass,
+          reconnectPeriod: 0,
+          keepalive: 30,
+          clean: true,
+          connectTimeout: connectTimeoutMs,
+        })
+
+        let settled = false
+        const statusTopic = `device/${d.mqtt_user}/${d.device_name}/status`
+
+        const onMessage = (topic: string, payload: Uint8Array) => {
+          if (topic !== statusTopic) return
+          const text = new TextDecoder().decode(payload)
+          let action = text
+          try {
+            const parsed = JSON.parse(text) as { action?: unknown }
+            if (parsed && typeof parsed.action === 'string') action = parsed.action
+          } catch {
+            void 0
+          }
+          const a = String(action ?? '').trim().toLowerCase()
+          const online = a !== 'offline'
+          setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: online }))
+        }
+
+        const done = (status: string) => {
+          if (settled) return
+          settled = true
+          if (runId !== connectivityRunRef.current) {
+            try {
+              client.off('message', onMessage)
+              client.end(true)
+            } catch {
+              void 0
+            }
+            return resolve()
+          }
+          setMqttStatusByDeviceId((prev) => ({ ...prev, [deviceId]: status }))
+          try {
+            client.off('message', onMessage)
+            client.end(true)
+          } catch {
+            void 0
+          }
+          resolve()
+        }
+
+        const t = window.setTimeout(() => done('Disconnected'), connectTimeoutMs)
+        client.on('connect', () => {
+          client.on('message', onMessage)
+          client.subscribe(statusTopic, { qos: 0 }, () => {
+            window.setTimeout(() => {
+              window.clearTimeout(t)
+              done('Connected')
+            }, 2500)
+          })
+        })
+        client.on('error', () => {
+          window.clearTimeout(t)
+          done('Error')
+        })
+        client.on('close', () => {
+          window.clearTimeout(t)
+          done('Disconnected')
+        })
+      })
+
+    const runBatch = async () => {
+      if (connectivityRunningRef.current) return
+      connectivityRunningRef.current = true
+      const runId = Date.now()
+      connectivityRunRef.current = runId
+
+      const queue = deviceCreds.slice()
+      const workers = Array.from({ length: Math.min(maxConcurrency, queue.length) }, async () => {
+        while (queue.length && !cancelled && connectivityRunRef.current === runId) {
+          const d = queue.shift()
+          if (!d) break
+          await checkOne(d, runId)
+        }
+      })
+      await Promise.all(workers)
+      if (!cancelled) connectivityRunningRef.current = false
     }
-  }, [devicesModalOpen])
+
+    void runBatch()
+    const t = window.setInterval(() => void runBatch(), intervalMs)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+      connectivityRunningRef.current = false
+    }
+  }, [deviceCreds, envMissing.length, mqttMap])
 
   return (
     <AppShell>
@@ -293,17 +379,19 @@ export default function DashboardPage() {
           <h1 className="text-lg font-semibold tracking-wide">管理總覽</h1>
         </div>
         <div className="flex items-center gap-2">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => {
-              if (devicesModalUserId) onOpenDevicesModal(devicesModalUserId)
-              else if (registered[0]?.email) onOpenDevicesModal(registered[0].email)
-            }}
-            disabled={!registered.length || envMissing.length > 0}
-          >
-            <Users className="h-4 w-4" />
-            管理設備
+          <div className="hidden items-center gap-2 lg:flex">
+            <div className="text-xs text-slate-400">帳號</div>
+            <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
+              <option value="all">全部</option>
+              {registered.map((r) => (
+                <option key={r.email} value={r.email}>
+                  {r.email}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <Button variant="secondary" size="sm" onClick={() => setRefreshNonce((v) => v + 1)} disabled={envMissing.length > 0}>
+            重新整理
           </Button>
         </div>
       </div>
@@ -366,7 +454,7 @@ export default function DashboardPage() {
               </div>
               <div>
                 <div className="text-xs text-slate-400">伺服器</div>
-                <div className="mt-1 text-lg font-semibold text-slate-200">{mqttList.length}</div>
+                <div className="mt-1 text-lg font-semibold text-slate-200">{mqttListVisible.length}</div>
               </div>
               <div>
                 <div className="text-xs text-slate-400">定位點</div>
@@ -384,7 +472,7 @@ export default function DashboardPage() {
               <CardTitle>定位點（positions）</CardTitle>
               <div className="flex items-center gap-2">
                 <div className="text-xs text-slate-400">帳號</div>
-                <Select value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+                <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
                   <option value="all">全部</option>
                   {registered.map((r) => (
                     <option key={r.email} value={r.email}>
@@ -399,9 +487,8 @@ export default function DashboardPage() {
             {loadError ? (
               <div className="rounded-xl border border-rose-400/30 bg-rose-400/10 px-4 py-3 text-sm text-rose-200">{loadError}</div>
             ) : (
-              <GooglePositionsMap
-                apiKey={positionsMarkers.apiKey}
-                markers={positionsMarkers.markers}
+              <LeafletPositionsMap
+                markers={positionsMarkers}
                 className="h-[420px] w-full overflow-hidden rounded-xl border border-slate-800/60"
               />
             )}
@@ -415,20 +502,24 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent>
             <div className="space-y-2">
-              {mqttList.length === 0 ? (
+              {mqttListVisible.length === 0 ? (
                 <div className="text-sm text-slate-300">{loading ? '讀取中…' : '目前沒有資料'}</div>
               ) : (
-                mqttList.map((s) => (
+                mqttListVisible.map((s) => {
+                  const status = mqttServerStatus[s.server_no] ?? 'Unknown'
+                  const tone = status === 'Online' ? 'success' : status === 'Offline' ? 'danger' : 'muted'
+                  return (
                   <div key={s.server_no} className="flex items-start justify-between gap-3 rounded-lg border border-slate-800/60 bg-white/5 px-3 py-2">
                     <div>
                       <div className="text-sm font-medium text-slate-100">Server #{s.server_no}</div>
                       <div className="text-xs text-slate-400 break-all">{s.url}</div>
                     </div>
                     <div className="pt-0.5">
-                      <StatusBadge tone="muted" label="Configured" />
+                      <StatusBadge tone={tone} label={status} />
                     </div>
                   </div>
-                ))
+                  )
+                })
               )}
             </div>
           </CardContent>
@@ -475,6 +566,7 @@ export default function DashboardPage() {
                 registered.map((r) => {
                   const s = deviceStatsByUser[r.email] ?? { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 }
                   const perms = getPermissions(r) || '—'
+                  const isSelected = selectedAccount === r.email
                   return (
                     <tr key={r.email} className="text-sm text-slate-200 hover:bg-white/5">
                       <td className="px-5 py-3 font-mono text-xs text-slate-200">{r.email}</td>
@@ -488,9 +580,9 @@ export default function DashboardPage() {
                       <td className="px-5 py-3">
                         <button
                           className="text-cyan-200 underline decoration-cyan-400/30 underline-offset-4 hover:text-cyan-100"
-                          onClick={() => onOpenDevicesModal(r.email)}
+                          onClick={() => setSelectedAccount(r.email)}
                         >
-                          查看設備
+                          {isSelected ? '已選取' : '選取'}
                         </button>
                       </td>
                     </tr>
@@ -502,42 +594,51 @@ export default function DashboardPage() {
         </div>
       </Card>
 
-      <Modal
-        open={devicesModalOpen}
-        title={devicesModalUserId ? `設備列表：${devicesModalUserId}` : '設備列表'}
-        onClose={() => setDevicesModalOpen(false)}
-      >
-        <div className="space-y-3">
-          {modalDevices.length === 0 ? (
+      <Card className="mt-4 overflow-hidden">
+        <CardHeader>
+          <CardTitle>帳號設備（device_credentials）</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+            <div className="text-sm text-slate-200">目前選取：{selectedAccount === 'all' ? '全部' : selectedAccount}</div>
+            <div className="flex items-center gap-2">
+              <div className="text-xs text-slate-400 lg:hidden">帳號</div>
+              <Select className="lg:hidden" value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
+                <option value="all">全部</option>
+                {registered.map((r) => (
+                  <option key={r.email} value={r.email}>
+                    {r.email}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          </div>
+
+          {selectedDevices.length === 0 ? (
             <div className="text-sm text-slate-300">沒有設備資料</div>
           ) : (
             <div className="overflow-x-auto rounded-xl border border-slate-800/60">
               <table className="min-w-[980px] w-full">
                 <thead className="bg-white/5">
                   <tr className="text-left text-xs text-slate-400">
+                    <th className="px-4 py-3 font-medium">user_id</th>
                     <th className="px-4 py-3 font-medium">設備</th>
                     <th className="px-4 py-3 font-medium">server_no</th>
                     <th className="px-4 py-3 font-medium">mqtt_user</th>
                     <th className="px-4 py-3 font-medium">share_from</th>
                     <th className="px-4 py-3 font-medium">連線</th>
-                    <th className="px-4 py-3 font-medium">操作</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {modalDevices.map((d) => {
-                    const status = mqttStatusByDeviceId[d.id] ?? 'Disconnected'
-                    const tone: 'success' | 'warning' | 'danger' | 'muted' =
-                      status === 'Connected'
-                        ? 'success'
-                        : status === 'Connecting...'
-                          ? 'warning'
-                          : status === 'Error'
-                            ? 'danger'
-                            : status === 'NoCredentials' || status === 'NoServerUrl'
-                              ? 'muted'
-                              : 'muted'
+                  {selectedDevices.map((d) => {
+                    const brokerStatus = mqttStatusByDeviceId[d.id] ?? 'Unknown'
+                    const deviceOnline = deviceOnlineByDeviceId[d.id] ?? null
+                    const status = deviceOnline === null ? '...' : deviceOnline ? 'Connected' : 'Disconnected'
+                    const tone: 'success' | 'danger' | 'muted' =
+                      deviceOnline === null ? 'muted' : deviceOnline ? 'success' : 'danger'
                     return (
                       <tr key={d.id} className="text-sm text-slate-200 hover:bg-white/5">
+                        <td className="px-4 py-3 font-mono text-xs text-slate-300">{d.user_id}</td>
                         <td className="px-4 py-3">
                           <div className="font-medium">{displayDeviceName(d)}</div>
                           <div className="text-xs text-slate-400">ID: {d.id}</div>
@@ -548,18 +649,11 @@ export default function DashboardPage() {
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <Wifi className="h-4 w-4 text-cyan-200" />
-                            <StatusBadge tone={tone} label={status} />
+                            <div className={status === 'Disconnected' ? 'animate-pulse' : undefined}>
+                              <StatusBadge tone={tone} label={status} />
+                            </div>
                           </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Button size="sm" onClick={() => testDeviceMqtt(d)}>
-                              測試連線
-                            </Button>
-                            <Button size="sm" variant="secondary" onClick={() => stopDeviceClient(d.id)}>
-                              斷開
-                            </Button>
-                          </div>
+                          <div className="mt-1 text-xs text-slate-400">Broker: {brokerStatus}</div>
                         </td>
                       </tr>
                     )
@@ -568,9 +662,9 @@ export default function DashboardPage() {
               </table>
             </div>
           )}
-          <div className="text-xs text-slate-400">連線測試參考附件邏輯：依 server_no 從 mqtt_list 取得 URL，使用 mqtt_user/mqtt_pass 連線。</div>
-        </div>
-      </Modal>
+          <div className="mt-2 text-xs text-slate-400">主動測試連線：依 server_no 從 mqtt_list 取得 URL，使用 mqtt_user/mqtt_pass 連線後立即斷開。</div>
+        </CardContent>
+      </Card>
     </AppShell>
   )
 }

@@ -24,23 +24,12 @@ export default function AuthPage() {
     setBusy(true)
     try {
       const normalizedEmail = email.trim().toLowerCase()
+      const { data: isAdmin, error: permErr } = await supabase.rpc('check_admin_email', { p_email: normalizedEmail })
+      if (permErr) throw new Error('權限驗證失敗，請稍後再試')
+      if (!isAdmin) throw new Error('此帳號沒有管理員權限，無法登入')
+
       const { error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password })
       if (error) throw error
-
-      const { data: adminRow, error: adminErr } = await supabase
-        .from('registered_emails')
-        .select('*')
-        .eq('email', normalizedEmail)
-        .maybeSingle()
-      if (adminErr) throw adminErr
-
-      const permissions =
-        (adminRow && 'permissions' in adminRow ? (adminRow as { permissions?: string | null }).permissions : undefined) ??
-        (adminRow && 'Permissions' in adminRow ? (adminRow as { Permissions?: string | null }).Permissions : undefined)
-      if (permissions !== 'admin') {
-        await supabase.auth.signOut()
-        throw new Error('此帳號沒有管理員權限，無法登入')
-      }
 
       setMsg('登入成功')
     } catch (e) {
