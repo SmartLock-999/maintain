@@ -172,63 +172,23 @@ export default function DashboardPage() {
     return list
   }, [accountLabel, deviceCreds, positions, registered, toAccountKey])
 
-  const deviceOwnershipById = useMemo(() => {
-    const map = new Map<string, string>()
-    for (const d of deviceCreds) {
-      const deviceId = String(d.id ?? '').trim()
-      if (!deviceId) continue
-      const shareFrom = String(d.share_from ?? '').trim()
-      const ownerKey = toAccountKey(shareFrom || d.user_id)
-      if (!ownerKey) continue
-      const existing = map.get(deviceId)
-      if (!existing) {
-        map.set(deviceId, ownerKey)
-        continue
-      }
-      if (shareFrom) map.set(deviceId, ownerKey)
-    }
-    return map
-  }, [deviceCreds, toAccountKey])
-
   const deviceStatsByUser = useMemo(() => {
-    const ownedBy: Record<string, Set<string>> = {}
-    const sharedInBy: Record<string, Set<string>> = {}
-    const sharedOutBy: Record<string, Set<string>> = {}
-    const ensure = (m: Record<string, Set<string>>, k: string) => (m[k] ??= new Set<string>())
-
-    for (const [deviceId, ownerKey] of deviceOwnershipById.entries()) {
-      ensure(ownedBy, ownerKey).add(deviceId)
-    }
-
-    for (const d of deviceCreds) {
-      const deviceId = String(d.id ?? '').trim()
-      if (!deviceId) continue
-      const shareFrom = String(d.share_from ?? '').trim()
-      if (!shareFrom) continue
-      const ownerKey = toAccountKey(shareFrom)
-      const recipientKey = toAccountKey(d.user_id)
-      if (ownerKey) ensure(sharedOutBy, ownerKey).add(deviceId)
-      if (recipientKey) ensure(sharedInBy, recipientKey).add(deviceId)
-    }
-
     const stats: Record<string, { owned: number; sharedIn: number; sharedOut: number; total: number }> = {}
-    const keys = new Set<string>([
-      ...Object.keys(ownedBy),
-      ...Object.keys(sharedInBy),
-      ...Object.keys(sharedOutBy),
-    ])
-    for (const key of keys) {
-      const owned = ownedBy[key]?.size ?? 0
-      const sharedIn = sharedInBy[key]?.size ?? 0
-      const sharedOut = sharedOutBy[key]?.size ?? 0
-      const total = new Set<string>([
-        ...(ownedBy[key] ? Array.from(ownedBy[key]) : []),
-        ...(sharedInBy[key] ? Array.from(sharedInBy[key]) : []),
-      ]).size
-      stats[key] = { owned, sharedIn, sharedOut, total }
+    const ensure = (k: string) => (stats[k] ??= { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 })
+    for (const d of deviceCreds) {
+      const userId = toAccountKey(d.user_id)
+      if (!userId) continue
+      const s = ensure(userId)
+      s.total += 1
+      if (d.share_from) s.sharedIn += 1
+      else s.owned += 1
+      if (d.share_from) {
+        const ownerId = toAccountKey(d.share_from)
+        if (ownerId) ensure(ownerId).sharedOut += 1
+      }
     }
     return stats
-  }, [deviceCreds, deviceOwnershipById, toAccountKey])
+  }, [deviceCreds, toAccountKey])
 
   const positionsMarkers = useMemo(() => {
     const filtered =
@@ -306,34 +266,18 @@ export default function DashboardPage() {
     return set
   }, [deviceCreds])
 
-  const selectedOwnedDevices = useMemo(() => {
-    if (selectedAccount === 'all') return []
-    const deviceIds: string[] = []
-    for (const [deviceId, ownerKey] of deviceOwnershipById.entries()) {
-      if (ownerKey === selectedAccount) deviceIds.push(deviceId)
-    }
-    if (!deviceIds.length) return []
-
-    const rowsById = new Map<string, DeviceCredentialRow[]>()
+  const sharedOutDeviceIds = useMemo(() => {
+    const set = new Set<string>()
     for (const d of deviceCreds) {
-      const id = String(d.id ?? '').trim()
-      if (!id) continue
-      if (!rowsById.has(id)) rowsById.set(id, [])
-      rowsById.get(id)!.push(d)
+      if (String(d.share_from ?? '').trim()) set.add(d.id)
     }
+    return set
+  }, [deviceCreds])
 
-    const selected: { device: DeviceCredentialRow; ownerKey: string }[] = []
-    for (const id of deviceIds) {
-      const rows = rowsById.get(id) ?? []
-      const preferred =
-        rows.find((r) => toAccountKey(r.user_id) === selectedAccount && !String(r.share_from ?? '').trim()) ?? rows[0]
-      if (!preferred) continue
-      selected.push({ device: preferred, ownerKey: selectedAccount })
-    }
-    return selected
-  }, [deviceCreds, deviceOwnershipById, selectedAccount, toAccountKey])
-
-  const selectedDevices = useMemo(() => selectedOwnedDevices.map((x) => x.device), [selectedOwnedDevices])
+  const selectedDevices = useMemo(() => {
+    if (selectedAccount === 'all') return []
+    return deviceCreds.filter((d) => toAccountKey(d.user_id) === selectedAccount)
+  }, [deviceCreds, selectedAccount, toAccountKey])
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
@@ -384,10 +328,11 @@ export default function DashboardPage() {
   const allOnlineDevicesCount = useMemo(() => {
     let count = 0
     for (const id of registeredDeviceIds) {
+      if (sharedOutDeviceIds.has(id)) continue
       if ((deviceConnectionById[id] ?? 'Unknown') === 'Online') count += 1
     }
     return count
-  }, [deviceConnectionById, registeredDeviceIds])
+  }, [deviceConnectionById, registeredDeviceIds, sharedOutDeviceIds])
 
   const deviceOnlineStatsByUser = useMemo(() => {
     const map: Record<string, { online: number; total: number }> = {}
@@ -777,10 +722,9 @@ export default function DashboardPage() {
                     const tone: 'success' | 'danger' | 'muted' = s === 'Online' ? 'success' : s === 'Offline' ? 'danger' : 'muted'
                     const label = s === 'Online' ? '線上' : s === 'Offline' ? '離線' : '未知'
                     const updatedAt = deviceOnlineByDeviceId[d.id]?.updatedAt ?? null
-                    const ownerKey = deviceOwnershipById.get(d.id) ?? toAccountKey(d.user_id)
                     return (
                       <tr key={d.id} className="text-sm text-slate-200 hover:bg-white/5">
-                        <td className="px-4 py-3 font-mono text-xs text-slate-300">{accountLabel(ownerKey)}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-slate-300">{d.user_id}</td>
                         <td className="px-4 py-3">
                           <div className="font-medium">{displayDeviceName(d)}</div>
                           <div className="text-xs text-slate-400">ID: {d.id}</div>
