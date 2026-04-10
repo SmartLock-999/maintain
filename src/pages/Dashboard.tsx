@@ -105,7 +105,6 @@ export default function DashboardPage() {
 
   const connectivityRunRef = useRef(0)
   const connectivityRunningRef = useRef(false)
-  const [probeStatusByDeviceId, setProbeStatusByDeviceId] = useState<Record<string, string>>({})
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
@@ -260,7 +259,7 @@ export default function DashboardPage() {
   }, [envMissing.length, refreshNonce])
 
   const selectedDevices = useMemo(() => {
-    if (selectedAccount === 'all') return deviceCreds
+    if (selectedAccount === 'all') return []
     return deviceCreds.filter((d) => toAccountKey(d.user_id) === selectedAccount)
   }, [deviceCreds, selectedAccount, toAccountKey])
 
@@ -362,20 +361,10 @@ export default function DashboardPage() {
         const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
         const raw = mqttMap[no]
         const url = raw ? normalizeBrokerUrl(raw) : null
-        if (!url || !raw?.trim()) {
-          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoServerUrl' }))
-          return resolve()
-        }
-        if (!d.mqtt_user || !d.mqtt_pass) {
-          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoCredentials' }))
-          return resolve()
-        }
-        if (!d.device_name) {
-          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoTopic' }))
-          return resolve()
-        }
+        if (!url || !raw?.trim()) return resolve()
+        if (!d.mqtt_user || !d.mqtt_pass) return resolve()
+        if (!d.device_name) return resolve()
 
-        setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Checking' }))
         const client = mqtt.connect(url, {
           username: d.mqtt_user,
           password: d.mqtt_pass,
@@ -386,10 +375,9 @@ export default function DashboardPage() {
         })
 
         let settled = false
-        let gotMessage = false
         const statusTopic = `device/${d.mqtt_user}/${d.device_name}/status`
 
-        const done = (status: string) => {
+        const done = () => {
           if (settled) return
           settled = true
           if (runId !== connectivityRunRef.current) {
@@ -400,7 +388,6 @@ export default function DashboardPage() {
             }
             return resolve()
           }
-          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: status }))
           try {
             client.end(true)
           } catch {
@@ -411,29 +398,28 @@ export default function DashboardPage() {
 
         const onMessage = (topic: string, payload: Uint8Array) => {
           if (topic !== statusTopic) return
-          gotMessage = true
           const text = new TextDecoder().decode(payload)
           const action = parseStatusAction(text)
           const a = String(action ?? '').trim().toLowerCase()
           const online = a !== 'offline' && a !== 'disconnected'
           setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: { online, updatedAt: Date.now() } }))
-          done('OK')
+          done()
         }
 
         const t = window.setTimeout(() => {
-          done(gotMessage ? 'OK' : 'Timeout')
+          done()
         }, messageTimeoutMs)
 
         client.on('connect', () => {
           client.on('message', onMessage)
           client.subscribe(statusTopic, { qos: 0 }, () => {
             window.clearTimeout(t)
-            window.setTimeout(() => done(gotMessage ? 'OK' : 'Timeout'), messageTimeoutMs)
+            window.setTimeout(() => done(), messageTimeoutMs)
           })
         })
 
-        client.on('error', () => done('Error'))
-        client.on('close', () => done(gotMessage ? 'OK' : 'Disconnected'))
+        client.on('error', () => done())
+        client.on('close', () => done())
       })
 
     const runBatch = async () => {
@@ -512,42 +498,25 @@ export default function DashboardPage() {
             </div>
             <div className="mt-2 text-xs text-slate-400">管理員：{adminCount} 筆</div>
             <div className="mt-1 text-xs text-slate-400">登入：{user?.email ?? '—'}</div>
-            <div className="mt-3 text-xs text-slate-400">點選帳號可切換顯示該帳號設備狀態</div>
-            <div className="mt-2 max-h-[160px] space-y-1 overflow-auto pr-1">
-              <button
-                type="button"
-                onClick={() => setSelectedAccount('all')}
-                className="flex w-full items-center justify-between rounded-lg border border-slate-800/60 bg-white/5 px-3 py-2 text-left text-xs text-slate-200 hover:bg-white/10"
-              >
-                <span className="truncate">全部</span>
-                <span className="text-slate-400">
-                  {allOnlineDevicesCount}/{deviceCreds.length}
-                </span>
-              </button>
-              {accounts.map((a) => {
-                const online = deviceOnlineStatsByUser[a.key]?.online ?? 0
-                const total = deviceOnlineStatsByUser[a.key]?.total ?? 0
-                return (
-                  <button
-                    key={a.key}
-                    type="button"
-                    onClick={() => setSelectedAccount(a.key)}
-                    className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left text-xs hover:bg-white/10 ${
-                      selectedAccount === a.key
-                        ? 'border-cyan-400/30 bg-cyan-400/10 text-cyan-100'
-                        : 'border-slate-800/60 bg-white/5 text-slate-200'
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate">{a.label}</div>
-                      {userIdToEmail[a.key] ? <div className="truncate text-[10px] text-slate-400">{a.key}</div> : null}
-                    </div>
-                    <span className={selectedAccount === a.key ? 'text-cyan-200/80' : 'text-slate-400'}>
-                      {online}/{total}
-                    </span>
-                  </button>
-                )
-              })}
+            <div className="mt-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <div className="text-xs text-slate-400">選擇帳號</div>
+                <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
+                  <option value="all">請選擇…</option>
+                  {accounts.map((a) => (
+                    <option key={a.key} value={a.key}>
+                      {a.label}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              {selectedAccount !== 'all' ? (
+                <div className="text-xs text-slate-400">
+                  線上 {deviceOnlineStatsByUser[selectedAccount]?.online ?? 0} / {deviceOnlineStatsByUser[selectedAccount]?.total ?? 0}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-400">選擇帳號後顯示該帳號設備資料</div>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -721,14 +690,14 @@ export default function DashboardPage() {
         </CardHeader>
         <CardContent>
           <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-            <div className="text-sm text-slate-200">目前選取：{selectedAccount === 'all' ? '全部' : selectedAccount}</div>
+            <div className="text-sm text-slate-200">目前選取：{selectedAccount === 'all' ? '—' : accountLabel(selectedAccount)}</div>
             <div className="text-xs text-slate-400">
               線上 {selectedDeviceConnectionStats.online} ｜ 離線 {selectedDeviceConnectionStats.offline} ｜ 未知 {selectedDeviceConnectionStats.unknown}
             </div>
             <div className="flex items-center gap-2">
               <div className="text-xs text-slate-400 lg:hidden">帳號</div>
               <Select className="lg:hidden" value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
-                <option value="all">全部</option>
+                <option value="all">請選擇…</option>
                 {accounts.map((a) => (
                   <option key={a.key} value={a.key}>
                     {a.label}
@@ -738,7 +707,9 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          {selectedDevices.length === 0 ? (
+          {selectedAccount === 'all' ? (
+            <div className="text-sm text-slate-300">請先選擇帳號</div>
+          ) : selectedDevices.length === 0 ? (
             <div className="text-sm text-slate-300">沒有設備資料</div>
           ) : (
             <div className="overflow-x-auto rounded-xl border border-slate-800/60">
@@ -759,7 +730,6 @@ export default function DashboardPage() {
                     const tone: 'success' | 'danger' | 'muted' = s === 'Online' ? 'success' : s === 'Offline' ? 'danger' : 'muted'
                     const label = s === 'Online' ? '線上' : s === 'Offline' ? '離線' : '未知'
                     const updatedAt = deviceOnlineByDeviceId[d.id]?.updatedAt ?? null
-                    const probe = probeStatusByDeviceId[d.id] ?? ''
                     return (
                       <tr key={d.id} className="text-sm text-slate-200 hover:bg-white/5">
                         <td className="px-4 py-3 font-mono text-xs text-slate-300">{d.user_id}</td>
@@ -776,7 +746,6 @@ export default function DashboardPage() {
                             <StatusBadge tone={tone} label={label} />
                           </div>
                           <div className="mt-1 text-xs text-slate-400">最後更新：{formatTs(updatedAt ? new Date(updatedAt).toISOString() : null)}</div>
-                          {probe && probe !== 'OK' ? <div className="mt-1 text-xs text-rose-200">檢查：{probe}</div> : null}
                         </td>
                       </tr>
                     )
