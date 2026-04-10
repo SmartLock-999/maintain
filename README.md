@@ -43,7 +43,6 @@ npm.cmd run test
 3. 到 Repo → Settings → Secrets and variables → Actions → Secrets 新增：
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
-   - `VITE_GOOGLE_MAPS_API_KEY`（首頁 Google 地圖用）
 
 ### 方式 B：手動一鍵發布（gh-pages）
 1. 建置
