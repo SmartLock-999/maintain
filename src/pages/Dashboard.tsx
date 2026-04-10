@@ -258,23 +258,26 @@ export default function DashboardPage() {
     }
   }, [envMissing.length, refreshNonce])
 
-  const deviceOwners = useMemo(() => {
-    const map = new Map<string, { device: DeviceCredentialRow; ownerKey: string }>()
+  const registeredDeviceIds = useMemo(() => {
+    const set = new Set<string>()
     for (const d of deviceCreds) {
-      const rawOwner = String(d.share_from ?? '').trim()
-      const ownerKey = toAccountKey(rawOwner || d.user_id)
-      if (!ownerKey) continue
-      if (!map.has(d.id)) map.set(d.id, { device: d, ownerKey })
+      if (!String(d.share_from ?? '').trim()) set.add(d.id)
     }
-    return Array.from(map.values())
-  }, [deviceCreds, toAccountKey])
+    return set
+  }, [deviceCreds])
 
-  const selectedDeviceOwners = useMemo(() => {
+  const sharedOutDeviceIds = useMemo(() => {
+    const set = new Set<string>()
+    for (const d of deviceCreds) {
+      if (String(d.share_from ?? '').trim()) set.add(d.id)
+    }
+    return set
+  }, [deviceCreds])
+
+  const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
-    return deviceOwners.filter((x) => x.ownerKey === selectedAccount)
-  }, [deviceOwners, selectedAccount])
-
-  const selectedDevices = useMemo(() => selectedDeviceOwners.map((x) => x.device), [selectedDeviceOwners])
+    return deviceCreds.filter((d) => toAccountKey(d.user_id) === selectedAccount)
+  }, [deviceCreds, selectedAccount, toAccountKey])
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
@@ -310,40 +313,51 @@ export default function DashboardPage() {
     let online = 0
     let offline = 0
     let unknown = 0
-    for (const x of selectedDeviceOwners) {
-      const s = deviceConnectionById[x.device.id] ?? 'Unknown'
+    const seen = new Set<string>()
+    for (const d of selectedDevices) {
+      if (seen.has(d.id)) continue
+      seen.add(d.id)
+      const s = deviceConnectionById[d.id] ?? 'Unknown'
       if (s === 'Online') online += 1
       else if (s === 'Offline') offline += 1
       else unknown += 1
     }
     return { online, offline, unknown }
-  }, [deviceConnectionById, selectedDeviceOwners])
+  }, [deviceConnectionById, selectedDevices])
 
   const allOnlineDevicesCount = useMemo(() => {
     let count = 0
-    for (const x of deviceOwners) {
-      if ((deviceConnectionById[x.device.id] ?? 'Unknown') === 'Online') count += 1
+    for (const id of registeredDeviceIds) {
+      if (sharedOutDeviceIds.has(id)) continue
+      if ((deviceConnectionById[id] ?? 'Unknown') === 'Online') count += 1
     }
     return count
-  }, [deviceConnectionById, deviceOwners])
+  }, [deviceConnectionById, registeredDeviceIds, sharedOutDeviceIds])
 
   const deviceOnlineStatsByUser = useMemo(() => {
     const map: Record<string, { online: number; total: number }> = {}
     const ensure = (k: string) => (map[k] ??= { online: 0, total: 0 })
-    for (const x of deviceOwners) {
-      const s = ensure(x.ownerKey)
+    const seenByUser: Record<string, Set<string>> = {}
+    const ensureSeen = (k: string) => (seenByUser[k] ??= new Set<string>())
+    for (const d of deviceCreds) {
+      const userKey = toAccountKey(d.user_id)
+      if (!userKey) continue
+      const seen = ensureSeen(userKey)
+      if (seen.has(d.id)) continue
+      seen.add(d.id)
+      const s = ensure(userKey)
       s.total += 1
-      if ((deviceConnectionById[x.device.id] ?? 'Unknown') === 'Online') s.online += 1
+      if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') s.online += 1
     }
     return map
-  }, [deviceConnectionById, deviceOwners])
+  }, [deviceConnectionById, deviceCreds, toAccountKey])
 
   const mqttServerStatus = useMemo(() => {
     const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
     for (const row of mqttListVisible) map[row.server_no] = 'Unknown'
 
-    for (const x of deviceOwners) {
-      const d = x.device
+    for (const d of deviceCreds) {
+      if (String(d.share_from ?? '').trim()) continue
       const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
       if (!(no in map)) continue
       const s = deviceConnectionById[d.id] ?? 'Unknown'
@@ -351,7 +365,7 @@ export default function DashboardPage() {
       else if (s === 'Offline' && map[no] !== 'Online') map[no] = 'Offline'
     }
     return map
-  }, [deviceConnectionById, deviceOwners, mqttListVisible])
+  }, [deviceConnectionById, deviceCreds, mqttListVisible])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -528,7 +542,7 @@ export default function DashboardPage() {
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <div className="text-xs text-slate-400">設備</div>
-                <div className="mt-1 text-lg font-semibold text-cyan-200">{deviceOwners.length}</div>
+                <div className="mt-1 text-lg font-semibold text-cyan-200">{registeredDeviceIds.size}</div>
               </div>
               <div>
                 <div className="text-xs text-slate-400">伺服器</div>
@@ -703,15 +717,14 @@ export default function DashboardPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {selectedDeviceOwners.map((x) => {
-                    const d = x.device
+                  {selectedDevices.map((d) => {
                     const s = deviceConnectionById[d.id] ?? 'Unknown'
                     const tone: 'success' | 'danger' | 'muted' = s === 'Online' ? 'success' : s === 'Offline' ? 'danger' : 'muted'
                     const label = s === 'Online' ? '線上' : s === 'Offline' ? '離線' : '未知'
                     const updatedAt = deviceOnlineByDeviceId[d.id]?.updatedAt ?? null
                     return (
                       <tr key={d.id} className="text-sm text-slate-200 hover:bg-white/5">
-                        <td className="px-4 py-3 font-mono text-xs text-slate-300">{accountLabel(x.ownerKey)}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-slate-300">{d.user_id}</td>
                         <td className="px-4 py-3">
                           <div className="font-medium">{displayDeviceName(d)}</div>
                           <div className="text-xs text-slate-400">ID: {d.id}</div>
