@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Users, Wifi } from 'lucide-react'
 import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
@@ -12,6 +12,7 @@ import { formatTs } from '@/utils/time'
 import { LeafletPositionsMap } from '@/components/maps/LeafletPositionsMap'
 
 type RegisteredEmailRow = {
+  user_id?: string | null
   email: string
   permissions?: string | null
   Permissions?: string | null
@@ -109,58 +110,107 @@ export default function DashboardPage() {
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
 
-  const registeredByEmail = useMemo(() => {
-    const map: Record<string, RegisteredEmailRow> = {}
+  const emailToUserId = useMemo(() => {
+    const map: Record<string, string> = {}
     for (const r of registered) {
-      if (r.email) map[r.email] = r
+      const email = String(r.email ?? '').trim()
+      const userId = String(r.user_id ?? '').trim()
+      if (email && userId) map[email.toLowerCase()] = userId
     }
     return map
   }, [registered])
 
+  const userIdToEmail = useMemo(() => {
+    const map: Record<string, string> = {}
+    for (const r of registered) {
+      const email = String(r.email ?? '').trim()
+      const userId = String(r.user_id ?? '').trim()
+      if (email && userId) map[userId] = email
+    }
+    return map
+  }, [registered])
+
+  const toAccountKey = useCallback((raw: unknown): string => {
+    const v = String(raw ?? '').trim()
+    if (!v) return ''
+    const lower = v.toLowerCase()
+    const mapped = emailToUserId[lower]
+    return mapped ?? v
+  }, [emailToUserId])
+
+  const accountLabel = useCallback((accountKey: string): string => {
+    if (!accountKey) return '—'
+    return userIdToEmail[accountKey] ?? accountKey
+  }, [userIdToEmail])
+
+  const registeredByAccountKey = useMemo(() => {
+    const map: Record<string, RegisteredEmailRow> = {}
+    for (const r of registered) {
+      const key = toAccountKey(r.user_id ?? r.email)
+      if (key) map[key] = r
+    }
+    return map
+  }, [registered, toAccountKey])
+
   const accounts = useMemo(() => {
     const s = new Set<string>()
-    for (const r of registered) if (r.email) s.add(r.email)
-    for (const d of deviceCreds) if (d.user_id) s.add(String(d.user_id))
-    for (const p of positions) if (p.user_id) s.add(String(p.user_id))
-    return Array.from(s).filter(Boolean).sort((a, b) => a.localeCompare(b))
-  }, [deviceCreds, positions, registered])
+    for (const r of registered) {
+      const key = toAccountKey(r.user_id ?? r.email)
+      if (key) s.add(key)
+    }
+    for (const d of deviceCreds) {
+      const key = toAccountKey(d.user_id)
+      if (key) s.add(key)
+    }
+    for (const p of positions) {
+      const key = toAccountKey(p.user_id)
+      if (key) s.add(key)
+    }
+
+    const list = Array.from(s)
+      .map((key) => ({ key, label: accountLabel(key) }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+    return list
+  }, [accountLabel, deviceCreds, positions, registered, toAccountKey])
 
   const deviceStatsByUser = useMemo(() => {
     const stats: Record<string, { owned: number; sharedIn: number; sharedOut: number; total: number }> = {}
     const ensure = (k: string) => (stats[k] ??= { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 })
     for (const d of deviceCreds) {
-      const userId = String(d.user_id ?? '')
+      const userId = toAccountKey(d.user_id)
       if (!userId) continue
       const s = ensure(userId)
       s.total += 1
       if (d.share_from) s.sharedIn += 1
       else s.owned += 1
       if (d.share_from) {
-        const ownerId = String(d.share_from)
+        const ownerId = toAccountKey(d.share_from)
         if (ownerId) ensure(ownerId).sharedOut += 1
       }
     }
     return stats
-  }, [deviceCreds])
+  }, [deviceCreds, toAccountKey])
 
   const positionsMarkers = useMemo(() => {
-    const filtered = selectedAccount === 'all' ? positions : positions.filter((p) => String(p.user_id) === selectedAccount)
+    const filtered =
+      selectedAccount === 'all' ? positions : positions.filter((p) => toAccountKey(p.user_id) === selectedAccount)
     return filtered
       .map((p) => {
         const lat = asNumber(p.lat)
         const lng = asNumber(p.lng)
         if (lat === null || lng === null) return null
         const ts = p.captured_at ?? p.created_at ?? null
+        const accountKey = toAccountKey(p.user_id)
         return {
           id: p.id,
           lat,
           lng,
-          title: String(p.user_id ?? ''),
+          title: accountLabel(accountKey),
           subtitle: ts ? formatTs(ts) : undefined,
         }
       })
       .filter(Boolean) as { id: string; lat: number; lng: number; title?: string; subtitle?: string }[]
-  }, [positions, selectedAccount])
+  }, [accountLabel, positions, selectedAccount, toAccountKey])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -211,8 +261,8 @@ export default function DashboardPage() {
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return deviceCreds
-    return deviceCreds.filter((d) => String(d.user_id) === selectedAccount)
-  }, [deviceCreds, selectedAccount])
+    return deviceCreds.filter((d) => toAccountKey(d.user_id) === selectedAccount)
+  }, [deviceCreds, selectedAccount, toAccountKey])
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
@@ -269,14 +319,14 @@ export default function DashboardPage() {
     const map: Record<string, { online: number; total: number }> = {}
     const ensure = (k: string) => (map[k] ??= { online: 0, total: 0 })
     for (const d of deviceCreds) {
-      const userId = String(d.user_id ?? '')
+      const userId = toAccountKey(d.user_id)
       if (!userId) continue
       const s = ensure(userId)
       s.total += 1
       if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') s.online += 1
     }
     return map
-  }, [deviceConnectionById, deviceCreds])
+  }, [deviceConnectionById, deviceCreds, toAccountKey])
 
   const mqttServerStatus = useMemo(() => {
     const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
@@ -423,9 +473,9 @@ export default function DashboardPage() {
             <div className="text-xs text-slate-400">帳號</div>
             <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
               <option value="all">全部</option>
-              {accounts.map((email) => (
-                <option key={email} value={email}>
-                  {email}
+              {accounts.map((a) => (
+                <option key={a.key} value={a.key}>
+                  {a.label}
                 </option>
               ))}
             </Select>
@@ -472,22 +522,25 @@ export default function DashboardPage() {
                   {allOnlineDevicesCount}/{deviceCreds.length}
                 </span>
               </button>
-              {accounts.map((email) => {
-                const online = deviceOnlineStatsByUser[email]?.online ?? 0
-                const total = deviceOnlineStatsByUser[email]?.total ?? 0
+              {accounts.map((a) => {
+                const online = deviceOnlineStatsByUser[a.key]?.online ?? 0
+                const total = deviceOnlineStatsByUser[a.key]?.total ?? 0
                 return (
                   <button
-                    key={email}
+                    key={a.key}
                     type="button"
-                    onClick={() => setSelectedAccount(email)}
+                    onClick={() => setSelectedAccount(a.key)}
                     className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left text-xs hover:bg-white/10 ${
-                      selectedAccount === email
+                      selectedAccount === a.key
                         ? 'border-cyan-400/30 bg-cyan-400/10 text-cyan-100'
                         : 'border-slate-800/60 bg-white/5 text-slate-200'
                     }`}
                   >
-                    <span className="truncate">{email}</span>
-                    <span className={selectedAccount === email ? 'text-cyan-200/80' : 'text-slate-400'}>
+                    <div className="min-w-0">
+                      <div className="truncate">{a.label}</div>
+                      {userIdToEmail[a.key] ? <div className="truncate text-[10px] text-slate-400">{a.key}</div> : null}
+                    </div>
+                    <span className={selectedAccount === a.key ? 'text-cyan-200/80' : 'text-slate-400'}>
                       {online}/{total}
                     </span>
                   </button>
@@ -532,9 +585,9 @@ export default function DashboardPage() {
                 <div className="text-xs text-slate-400">帳號</div>
                 <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
                   <option value="all">全部</option>
-                  {accounts.map((email) => (
-                    <option key={email} value={email}>
-                      {email}
+                  {accounts.map((a) => (
+                    <option key={a.key} value={a.key}>
+                      {a.label}
                     </option>
                   ))}
                 </Select>
@@ -622,17 +675,20 @@ export default function DashboardPage() {
                   </td>
                 </tr>
               ) : (
-                accounts.map((email) => {
-                  const s = deviceStatsByUser[email] ?? { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 }
-                  const perms = getPermissions(registeredByEmail[email]) || '—'
-                  const isSelected = selectedAccount === email
+                accounts.map((a) => {
+                  const s = deviceStatsByUser[a.key] ?? { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 }
+                  const perms = getPermissions(registeredByAccountKey[a.key]) || '—'
+                  const isSelected = selectedAccount === a.key
                   return (
                     <tr
-                      key={email}
+                      key={a.key}
                       className={`cursor-pointer text-sm hover:bg-white/5 ${isSelected ? 'bg-cyan-400/5 text-cyan-100' : 'text-slate-200'}`}
-                      onClick={() => setSelectedAccount(email)}
+                      onClick={() => setSelectedAccount(a.key)}
                     >
-                      <td className="px-5 py-3 font-mono text-xs">{email}</td>
+                      <td className="px-5 py-3">
+                        <div className="font-mono text-xs">{a.label}</div>
+                        {userIdToEmail[a.key] ? <div className="mt-0.5 font-mono text-[10px] text-slate-400">{a.key}</div> : null}
+                      </td>
                       <td className="px-5 py-3">
                         <StatusBadge tone={perms === 'admin' ? 'success' : 'muted'} label={perms} />
                       </td>
@@ -643,7 +699,7 @@ export default function DashboardPage() {
                       <td className="px-5 py-3">
                         <button
                           className="text-cyan-200 underline decoration-cyan-400/30 underline-offset-4 hover:text-cyan-100"
-                          onClick={() => setSelectedAccount(email)}
+                          onClick={() => setSelectedAccount(a.key)}
                         >
                           {isSelected ? '已選取' : '選取'}
                         </button>
@@ -671,9 +727,9 @@ export default function DashboardPage() {
               <div className="text-xs text-slate-400 lg:hidden">帳號</div>
               <Select className="lg:hidden" value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
                 <option value="all">全部</option>
-                {accounts.map((email) => (
-                  <option key={email} value={email}>
-                    {email}
+                {accounts.map((a) => (
+                  <option key={a.key} value={a.key}>
+                    {a.label}
                   </option>
                 ))}
               </Select>

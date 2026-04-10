@@ -101,19 +101,20 @@ export function LeafletPositionsMap({ markers, className }: { markers: MarkerIte
         maxZoom={22}
       >
         <LayersControl position="topright">
-          <LayersControl.BaseLayer checked name="OpenStreetMap">
+          <LayersControl.BaseLayer checked name="衛星（Google）">
             <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-              maxNativeZoom={19}
+              url="https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}&scale=2"
+              subdomains={['mt0', 'mt1', 'mt2', 'mt3']}
+              attribution="&copy; Google Maps"
+              maxNativeZoom={21}
               maxZoom={22}
               detectRetina
             />
           </LayersControl.BaseLayer>
-          <LayersControl.BaseLayer name="衛星（Esri）">
+          <LayersControl.BaseLayer name="OpenStreetMap">
             <TileLayer
-              url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-              attribution="Tiles &copy; Esri"
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
               maxNativeZoom={19}
               maxZoom={22}
               detectRetina
