@@ -6,10 +6,7 @@ import { Input } from '@/components/ui/Input'
 import { supabase, getEnvMissing } from '@/utils/supabase'
 import { useAuthStore } from '@/stores/authStore'
 
-type Mode = 'login' | 'register'
-
 export default function AuthPage() {
-  const [mode, setMode] = useState<Mode>('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
@@ -26,16 +23,26 @@ export default function AuthPage() {
     setMsg(null)
     setBusy(true)
     try {
-      if (mode === 'login') {
-        const { error } = await supabase.auth.signInWithPassword({ email, password })
-        if (error) throw error
-        setMsg('登入成功')
-        return
+      const normalizedEmail = email.trim().toLowerCase()
+      const { error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password })
+      if (error) throw error
+
+      const { data: adminRow, error: adminErr } = await supabase
+        .from('registered_emails')
+        .select('*')
+        .eq('email', normalizedEmail)
+        .maybeSingle()
+      if (adminErr) throw adminErr
+
+      const permissions =
+        (adminRow && 'permissions' in adminRow ? (adminRow as { permissions?: string | null }).permissions : undefined) ??
+        (adminRow && 'Permissions' in adminRow ? (adminRow as { Permissions?: string | null }).Permissions : undefined)
+      if (permissions !== 'admin') {
+        await supabase.auth.signOut()
+        throw new Error('此帳號沒有管理員權限，無法登入')
       }
 
-      const { error } = await supabase.auth.signUp({ email, password })
-      if (error) throw error
-      setMsg('註冊成功，請檢查信箱完成驗證（若你已開啟 Email 驗證）')
+      setMsg('登入成功')
     } catch (e) {
       const message = e instanceof Error ? e.message : '操作失敗'
       setErr(message)
@@ -73,32 +80,14 @@ export default function AuthPage() {
           </div>
           <div>
             <div className="text-lg font-semibold">Smart Lock Console</div>
-            <div className="text-sm text-slate-400">暗色科技風管理後台</div>
           </div>
         </div>
 
         <Card>
           <CardHeader>
-            <CardTitle>登入 / 註冊</CardTitle>
+            <CardTitle>登入</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="mb-4 grid grid-cols-2 gap-2">
-              <Button
-                type="button"
-                variant={mode === 'login' ? 'primary' : 'secondary'}
-                onClick={() => setMode('login')}
-              >
-                登入
-              </Button>
-              <Button
-                type="button"
-                variant={mode === 'register' ? 'primary' : 'secondary'}
-                onClick={() => setMode('register')}
-              >
-                註冊
-              </Button>
-            </div>
-
             {missing.length ? (
               <div className="mb-4 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm text-rose-200">
                 尚未設定環境變數：{missing.join(', ')}（請參考 `.env.example`）
@@ -133,7 +122,7 @@ export default function AuthPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   type="password"
-                  autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                  autoComplete="current-password"
                 />
               </label>
             </div>
@@ -143,13 +132,11 @@ export default function AuthPage() {
                 忘記密碼
               </Button>
               <Button type="button" onClick={() => void onSubmit()} disabled={!canSubmit}>
-                {mode === 'login' ? '登入' : '建立帳號'}
+                登入
               </Button>
             </div>
           </CardContent>
         </Card>
-
-        <div className="mt-6 text-center text-xs text-slate-500">部署到 GitHub Pages 時請使用 HTTPS 才能取得定位</div>
       </div>
     </div>
   )
