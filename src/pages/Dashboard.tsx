@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Server, Users, Wifi } from 'lucide-react'
+import { Users, Wifi } from 'lucide-react'
+import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
 import { Button } from '@/components/ui/Button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card'
@@ -43,12 +44,6 @@ type PositionRow = {
   created_at?: string | null
 }
 
-type DeviceStatusRow = {
-  id: string
-  connection_status: string | null
-  last_seen_at: string | null
-}
-
 function asNumber(v: unknown): number | null {
   if (typeof v === 'number') return Number.isFinite(v) ? v : null
   if (typeof v === 'string') {
@@ -75,19 +70,27 @@ function displayDeviceName(d: DeviceCredentialRow): string {
   return d.id
 }
 
-function normalizeConnectionStatus(v: string | null | undefined): 'Online' | 'Offline' | 'Unknown' {
-  const s = String(v ?? '').trim().toLowerCase()
-  if (!s) return 'Unknown'
-  if (s.includes('online') || s.includes('connected')) return 'Online'
-  if (s.includes('offline') || s.includes('disconnected')) return 'Offline'
-  return 'Unknown'
+function normalizeBrokerUrl(raw: string): string {
+  const s = raw.trim()
+  if (/^wss?:\/\//i.test(s)) return s
+  return `wss://${s}:8884/mqtt`
+}
+
+function parseStatusAction(payloadText: string): string {
+  const text = payloadText.trim()
+  if (!text) return ''
+  try {
+    const parsed = JSON.parse(text) as { action?: unknown }
+    if (parsed && typeof parsed.action === 'string') return parsed.action
+  } catch {
+    void 0
+  }
+  return text
 }
 
 export default function DashboardPage() {
   const user = useAuthStore((s) => s.user)
   const envMissing = useAuthStore((s) => s.envMissing)
-  const [serverOk, setServerOk] = useState<boolean | null>(null)
-  const [serverErr, setServerErr] = useState<string | null>(null)
   const [refreshNonce, setRefreshNonce] = useState(0)
 
   const [mqttList, setMqttList] = useState<MqttListRow[]>([])
@@ -99,11 +102,28 @@ export default function DashboardPage() {
 
   const [selectedAccount, setSelectedAccount] = useState<string>('all')
 
-  const [deviceStatusById, setDeviceStatusById] = useState<Record<string, DeviceStatusRow>>({})
-  const [deviceStatusError, setDeviceStatusError] = useState<string | null>(null)
-  const deviceStatusRunRef = useRef(0)
+  const connectivityRunRef = useRef(0)
+  const connectivityRunningRef = useRef(false)
+  const [probeStatusByDeviceId, setProbeStatusByDeviceId] = useState<Record<string, string>>({})
+  const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
+
+  const registeredByEmail = useMemo(() => {
+    const map: Record<string, RegisteredEmailRow> = {}
+    for (const r of registered) {
+      if (r.email) map[r.email] = r
+    }
+    return map
+  }, [registered])
+
+  const accounts = useMemo(() => {
+    const s = new Set<string>()
+    for (const r of registered) if (r.email) s.add(r.email)
+    for (const d of deviceCreds) if (d.user_id) s.add(String(d.user_id))
+    for (const p of positions) if (p.user_id) s.add(String(p.user_id))
+    return Array.from(s).filter(Boolean).sort((a, b) => a.localeCompare(b))
+  }, [deviceCreds, positions, registered])
 
   const deviceStatsByUser = useMemo(() => {
     const stats: Record<string, { owned: number; sharedIn: number; sharedOut: number; total: number }> = {}
@@ -141,32 +161,6 @@ export default function DashboardPage() {
       })
       .filter(Boolean) as { id: string; lat: number; lng: number; title?: string; subtitle?: string }[]
   }, [positions, selectedAccount])
-
-  useEffect(() => {
-    if (envMissing.length) {
-      setServerOk(false)
-      setServerErr('尚未設定 Supabase 環境變數')
-      return
-    }
-    let cancelled = false
-    const ping = async () => {
-      const { error } = await supabase.from('devices').select('id', { count: 'exact', head: true }).limit(1)
-      if (cancelled) return
-      if (error) {
-        setServerOk(false)
-        setServerErr(error.message)
-        return
-      }
-      setServerOk(true)
-      setServerErr(null)
-    }
-    void ping()
-    const t = window.setInterval(() => void ping(), 30_000)
-    return () => {
-      cancelled = true
-      window.clearInterval(t)
-    }
-  }, [envMissing.length])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -222,13 +216,33 @@ export default function DashboardPage() {
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
+  const mqttMap = useMemo(() => {
+    const m: Record<number, string> = {}
+    for (const row of mqttListVisible) {
+      if (row.server_no != null && row.url) m[row.server_no] = row.url
+    }
+    return m
+  }, [mqttListVisible])
+
   const deviceConnectionById = useMemo(() => {
+    const nowMs = Date.now()
+    const ttlMs = 5 * 60_000
     const map: Record<string, 'Online' | 'Offline' | 'Unknown'> = {}
-    for (const [id, row] of Object.entries(deviceStatusById)) {
-      map[id] = normalizeConnectionStatus(row.connection_status)
+    for (const d of deviceCreds) {
+      const rec = deviceOnlineByDeviceId[d.id]
+      if (!rec) {
+        map[d.id] = 'Unknown'
+        continue
+      }
+      const stale = nowMs - rec.updatedAt > ttlMs
+      if (stale) {
+        map[d.id] = 'Unknown'
+        continue
+      }
+      map[d.id] = rec.online ? 'Online' : 'Offline'
     }
     return map
-  }, [deviceStatusById])
+  }, [deviceCreds, deviceOnlineByDeviceId])
 
   const selectedDeviceConnectionStats = useMemo(() => {
     let online = 0
@@ -251,6 +265,19 @@ export default function DashboardPage() {
     return count
   }, [deviceConnectionById, deviceCreds])
 
+  const deviceOnlineStatsByUser = useMemo(() => {
+    const map: Record<string, { online: number; total: number }> = {}
+    const ensure = (k: string) => (map[k] ??= { online: 0, total: 0 })
+    for (const d of deviceCreds) {
+      const userId = String(d.user_id ?? '')
+      if (!userId) continue
+      const s = ensure(userId)
+      s.total += 1
+      if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') s.online += 1
+    }
+    return map
+  }, [deviceConnectionById, deviceCreds])
+
   const mqttServerStatus = useMemo(() => {
     const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
     for (const row of mqttListVisible) map[row.server_no] = 'Unknown'
@@ -268,41 +295,121 @@ export default function DashboardPage() {
   useEffect(() => {
     if (envMissing.length) return
     if (!deviceCreds.length) return
+    const maxConcurrency = 6
+    const connectTimeoutMs = 8000
+    const messageTimeoutMs = 5000
+    const intervalMs = 60_000
+
     let cancelled = false
-    const runId = Date.now()
-    deviceStatusRunRef.current = runId
 
-    const run = async () => {
-      const ids = Array.from(new Set(deviceCreds.map((d) => d.id))).filter(Boolean)
-      if (!ids.length) return
-      setDeviceStatusError(null)
+    const checkOne = (d: DeviceCredentialRow, runId: number) =>
+      new Promise<void>((resolve) => {
+        if (cancelled) return resolve()
+        const deviceId = d.id
 
-      const chunkSize = 200
-      const next: Record<string, DeviceStatusRow> = {}
-      for (let i = 0; i < ids.length; i += chunkSize) {
-        if (cancelled || deviceStatusRunRef.current !== runId) return
-        const chunk = ids.slice(i, i + chunkSize)
-        const res = await supabase.from('devices').select('id,connection_status,last_seen_at').in('id', chunk)
-        if (cancelled || deviceStatusRunRef.current !== runId) return
-        if (res.error) {
-          setDeviceStatusError(res.error.message)
-          continue
+        const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
+        const raw = mqttMap[no]
+        const url = raw ? normalizeBrokerUrl(raw) : null
+        if (!url || !raw?.trim()) {
+          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoServerUrl' }))
+          return resolve()
         }
-        for (const row of (res.data ?? []) as DeviceStatusRow[]) {
-          if (row?.id) next[row.id] = row
+        if (!d.mqtt_user || !d.mqtt_pass) {
+          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoCredentials' }))
+          return resolve()
         }
-      }
-      if (cancelled || deviceStatusRunRef.current !== runId) return
-      setDeviceStatusById(next)
+        if (!d.device_name) {
+          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'NoTopic' }))
+          return resolve()
+        }
+
+        setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: 'Checking' }))
+        const client = mqtt.connect(url, {
+          username: d.mqtt_user,
+          password: d.mqtt_pass,
+          reconnectPeriod: 0,
+          keepalive: 30,
+          clean: true,
+          connectTimeout: connectTimeoutMs,
+        })
+
+        let settled = false
+        let gotMessage = false
+        const statusTopic = `device/${d.mqtt_user}/${d.device_name}/status`
+
+        const done = (status: string) => {
+          if (settled) return
+          settled = true
+          if (runId !== connectivityRunRef.current) {
+            try {
+              client.end(true)
+            } catch {
+              void 0
+            }
+            return resolve()
+          }
+          setProbeStatusByDeviceId((prev) => ({ ...prev, [deviceId]: status }))
+          try {
+            client.end(true)
+          } catch {
+            void 0
+          }
+          resolve()
+        }
+
+        const onMessage = (topic: string, payload: Uint8Array) => {
+          if (topic !== statusTopic) return
+          gotMessage = true
+          const text = new TextDecoder().decode(payload)
+          const action = parseStatusAction(text)
+          const a = String(action ?? '').trim().toLowerCase()
+          const online = a !== 'offline' && a !== 'disconnected'
+          setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: { online, updatedAt: Date.now() } }))
+          done('OK')
+        }
+
+        const t = window.setTimeout(() => {
+          done(gotMessage ? 'OK' : 'Timeout')
+        }, messageTimeoutMs)
+
+        client.on('connect', () => {
+          client.on('message', onMessage)
+          client.subscribe(statusTopic, { qos: 0 }, () => {
+            window.clearTimeout(t)
+            window.setTimeout(() => done(gotMessage ? 'OK' : 'Timeout'), messageTimeoutMs)
+          })
+        })
+
+        client.on('error', () => done('Error'))
+        client.on('close', () => done(gotMessage ? 'OK' : 'Disconnected'))
+      })
+
+    const runBatch = async () => {
+      if (connectivityRunningRef.current) return
+      connectivityRunningRef.current = true
+      const runId = Date.now()
+      connectivityRunRef.current = runId
+
+      const queue = deviceCreds.slice()
+      const workers = Array.from({ length: Math.min(maxConcurrency, queue.length) }, async () => {
+        while (queue.length && !cancelled && connectivityRunRef.current === runId) {
+          const d = queue.shift()
+          if (!d) break
+          await checkOne(d, runId)
+        }
+      })
+      await Promise.all(workers)
+      if (!cancelled) connectivityRunningRef.current = false
     }
 
-    void run()
-    const t = window.setInterval(() => void run(), 30_000)
+    void runBatch()
+    const t = window.setInterval(() => void runBatch(), intervalMs)
     return () => {
       cancelled = true
       window.clearInterval(t)
+      connectivityRunningRef.current = false
     }
-  }, [deviceCreds, envMissing.length, refreshNonce])
+  }, [deviceCreds, envMissing.length, mqttMap])
 
   return (
     <AppShell>
@@ -316,9 +423,9 @@ export default function DashboardPage() {
             <div className="text-xs text-slate-400">帳號</div>
             <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
               <option value="all">全部</option>
-              {registered.map((r) => (
-                <option key={r.email} value={r.email}>
-                  {r.email}
+              {accounts.map((email) => (
+                <option key={email} value={email}>
+                  {email}
                 </option>
               ))}
             </Select>
@@ -335,26 +442,7 @@ export default function DashboardPage() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        <Card>
-          <CardHeader>
-            <CardTitle>服務狀態</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-sm text-slate-200">
-                <Server className="h-4 w-4 text-cyan-200" />
-                Supabase 連線
-              </div>
-              <StatusBadge
-                tone={serverOk === true ? 'success' : serverOk === false ? 'danger' : 'warning'}
-                label={serverOk === true ? '正常' : serverOk === false ? '異常' : '檢查中'}
-              />
-            </div>
-            <div className="mt-2 text-xs text-slate-400">{serverErr ? `錯誤：${serverErr}` : '每 30 秒自動檢查一次'}</div>
-          </CardContent>
-        </Card>
-
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>帳號</CardTitle>
@@ -366,8 +454,8 @@ export default function DashboardPage() {
                 註冊帳號
               </div>
               <StatusBadge
-                tone={registered.length ? 'success' : 'muted'}
-                label={`${registered.length} 筆`}
+                tone={accounts.length ? 'success' : 'muted'}
+                label={`${accounts.length} 筆`}
               />
             </div>
             <div className="mt-2 text-xs text-slate-400">管理員：{adminCount} 筆</div>
@@ -384,25 +472,22 @@ export default function DashboardPage() {
                   {allOnlineDevicesCount}/{deviceCreds.length}
                 </span>
               </button>
-              {registered.map((r) => {
-                const total = deviceStatsByUser[r.email]?.total ?? 0
-                const online = deviceCreds.reduce((acc, d) => {
-                  if (String(d.user_id) !== r.email) return acc
-                  return (deviceConnectionById[d.id] ?? 'Unknown') === 'Online' ? acc + 1 : acc
-                }, 0)
+              {accounts.map((email) => {
+                const online = deviceOnlineStatsByUser[email]?.online ?? 0
+                const total = deviceOnlineStatsByUser[email]?.total ?? 0
                 return (
                   <button
-                    key={r.email}
+                    key={email}
                     type="button"
-                    onClick={() => setSelectedAccount(r.email)}
+                    onClick={() => setSelectedAccount(email)}
                     className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left text-xs hover:bg-white/10 ${
-                      selectedAccount === r.email
+                      selectedAccount === email
                         ? 'border-cyan-400/30 bg-cyan-400/10 text-cyan-100'
                         : 'border-slate-800/60 bg-white/5 text-slate-200'
                     }`}
                   >
-                    <span className="truncate">{r.email}</span>
-                    <span className={selectedAccount === r.email ? 'text-cyan-200/80' : 'text-slate-400'}>
+                    <span className="truncate">{email}</span>
+                    <span className={selectedAccount === email ? 'text-cyan-200/80' : 'text-slate-400'}>
                       {online}/{total}
                     </span>
                   </button>
@@ -432,7 +517,7 @@ export default function DashboardPage() {
               </div>
             </div>
             <div className="mt-2 text-xs text-slate-400">
-              {deviceStatusError ? `設備狀態讀取失敗：${deviceStatusError}` : '設備狀態每 30 秒自動刷新'}
+              來源：MQTT status topic（每 60 秒刷新，5 分鐘未更新視為未知）
             </div>
           </CardContent>
         </Card>
@@ -447,9 +532,9 @@ export default function DashboardPage() {
                 <div className="text-xs text-slate-400">帳號</div>
                 <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
                   <option value="all">全部</option>
-                  {registered.map((r) => (
-                    <option key={r.email} value={r.email}>
-                      {r.email}
+                  {accounts.map((email) => (
+                    <option key={email} value={email}>
+                      {email}
                     </option>
                   ))}
                 </Select>
@@ -481,6 +566,7 @@ export default function DashboardPage() {
                 mqttListVisible.map((s) => {
                   const status = mqttServerStatus[s.server_no] ?? 'Unknown'
                   const tone = status === 'Online' ? 'success' : status === 'Offline' ? 'danger' : 'muted'
+                  const label = status === 'Online' ? '線上' : status === 'Offline' ? '離線' : '未知'
                   return (
                   <div key={s.server_no} className="flex items-start justify-between gap-3 rounded-lg border border-slate-800/60 bg-white/5 px-3 py-2">
                     <div>
@@ -488,7 +574,7 @@ export default function DashboardPage() {
                       <div className="text-xs text-slate-400 break-all">{s.url}</div>
                     </div>
                     <div className="pt-0.5">
-                      <StatusBadge tone={tone} label={status} />
+                      <StatusBadge tone={tone} label={label} />
                     </div>
                   </div>
                   )
@@ -501,7 +587,7 @@ export default function DashboardPage() {
 
       <Card className="mt-4 overflow-hidden">
         <CardHeader>
-          <CardTitle>註冊帳號（registered_emails）</CardTitle>
+          <CardTitle>帳號清單</CardTitle>
         </CardHeader>
         <div className="overflow-x-auto">
           <table className="min-w-[980px] w-full">
@@ -529,24 +615,24 @@ export default function DashboardPage() {
                     {loadError}
                   </td>
                 </tr>
-              ) : registered.length === 0 ? (
+              ) : accounts.length === 0 ? (
                 <tr>
                   <td className="px-5 py-6 text-sm text-slate-300" colSpan={7}>
                     目前沒有資料
                   </td>
                 </tr>
               ) : (
-                registered.map((r) => {
-                  const s = deviceStatsByUser[r.email] ?? { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 }
-                  const perms = getPermissions(r) || '—'
-                  const isSelected = selectedAccount === r.email
+                accounts.map((email) => {
+                  const s = deviceStatsByUser[email] ?? { owned: 0, sharedIn: 0, sharedOut: 0, total: 0 }
+                  const perms = getPermissions(registeredByEmail[email]) || '—'
+                  const isSelected = selectedAccount === email
                   return (
                     <tr
-                      key={r.email}
+                      key={email}
                       className={`cursor-pointer text-sm hover:bg-white/5 ${isSelected ? 'bg-cyan-400/5 text-cyan-100' : 'text-slate-200'}`}
-                      onClick={() => setSelectedAccount(r.email)}
+                      onClick={() => setSelectedAccount(email)}
                     >
-                      <td className="px-5 py-3 font-mono text-xs">{r.email}</td>
+                      <td className="px-5 py-3 font-mono text-xs">{email}</td>
                       <td className="px-5 py-3">
                         <StatusBadge tone={perms === 'admin' ? 'success' : 'muted'} label={perms} />
                       </td>
@@ -557,7 +643,7 @@ export default function DashboardPage() {
                       <td className="px-5 py-3">
                         <button
                           className="text-cyan-200 underline decoration-cyan-400/30 underline-offset-4 hover:text-cyan-100"
-                          onClick={() => setSelectedAccount(r.email)}
+                          onClick={() => setSelectedAccount(email)}
                         >
                           {isSelected ? '已選取' : '選取'}
                         </button>
@@ -585,9 +671,9 @@ export default function DashboardPage() {
               <div className="text-xs text-slate-400 lg:hidden">帳號</div>
               <Select className="lg:hidden" value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
                 <option value="all">全部</option>
-                {registered.map((r) => (
-                  <option key={r.email} value={r.email}>
-                    {r.email}
+                {accounts.map((email) => (
+                  <option key={email} value={email}>
+                    {email}
                   </option>
                 ))}
               </Select>
@@ -614,7 +700,8 @@ export default function DashboardPage() {
                     const s = deviceConnectionById[d.id] ?? 'Unknown'
                     const tone: 'success' | 'danger' | 'muted' = s === 'Online' ? 'success' : s === 'Offline' ? 'danger' : 'muted'
                     const label = s === 'Online' ? '線上' : s === 'Offline' ? '離線' : '未知'
-                    const lastSeenAt = deviceStatusById[d.id]?.last_seen_at ?? null
+                    const updatedAt = deviceOnlineByDeviceId[d.id]?.updatedAt ?? null
+                    const probe = probeStatusByDeviceId[d.id] ?? ''
                     return (
                       <tr key={d.id} className="text-sm text-slate-200 hover:bg-white/5">
                         <td className="px-4 py-3 font-mono text-xs text-slate-300">{d.user_id}</td>
@@ -630,7 +717,8 @@ export default function DashboardPage() {
                             <Wifi className="h-4 w-4 text-cyan-200" />
                             <StatusBadge tone={tone} label={label} />
                           </div>
-                          <div className="mt-1 text-xs text-slate-400">最後回報：{formatTs(lastSeenAt)}</div>
+                          <div className="mt-1 text-xs text-slate-400">最後更新：{formatTs(updatedAt ? new Date(updatedAt).toISOString() : null)}</div>
+                          {probe && probe !== 'OK' ? <div className="mt-1 text-xs text-rose-200">檢查：{probe}</div> : null}
                         </td>
                       </tr>
                     )
@@ -639,7 +727,7 @@ export default function DashboardPage() {
               </table>
             </div>
           )}
-          <div className="mt-2 text-xs text-slate-400">連線狀態來源：devices.connection_status / last_seen_at（每 30 秒自動刷新）</div>
+          <div className="mt-2 text-xs text-slate-400">連線狀態來源：device/&lt;mqtt_user&gt;/&lt;device_name&gt;/status（每 60 秒自動刷新）</div>
         </CardContent>
       </Card>
     </AppShell>
