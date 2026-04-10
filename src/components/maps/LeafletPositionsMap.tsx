@@ -11,12 +11,15 @@ type MarkerItem = {
 
 function FitToMarkers({ markers }: { markers: MarkerItem[] }) {
   const map = useMap()
+  const [didFit, setDidFit] = useState(false)
 
   useEffect(() => {
     if (!markers.length) return
+    if (didFit) return
     const latLngs = markers.map((m) => [m.lat, m.lng] as [number, number])
     map.fitBounds(latLngs, { padding: [40, 40] })
-  }, [map, markers])
+    setDidFit(true)
+  }, [didFit, map, markers])
 
   return null
 }
@@ -34,7 +37,7 @@ function LocateControl() {
         setBusy(false)
         const { latitude, longitude, accuracy } = pos.coords
         setPos({ lat: latitude, lng: longitude, accuracyM: Number.isFinite(accuracy) ? accuracy : undefined })
-        map.flyTo([latitude, longitude], Math.max(map.getZoom(), 15), { animate: true, duration: 0.7 })
+        map.flyTo([latitude, longitude], map.getZoom(), { animate: true, duration: 0.7 })
       },
       () => {
         setBusy(false)

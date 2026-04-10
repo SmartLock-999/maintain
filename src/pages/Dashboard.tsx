@@ -294,6 +294,8 @@ export default function DashboardPage() {
     return map
   }, [deviceCreds, deviceOnlineByDeviceId])
 
+  const ownedDevices = useMemo(() => deviceCreds.filter((d) => !d.share_from), [deviceCreds])
+
   const selectedDeviceConnectionStats = useMemo(() => {
     let online = 0
     let offline = 0
@@ -309,16 +311,16 @@ export default function DashboardPage() {
 
   const allOnlineDevicesCount = useMemo(() => {
     let count = 0
-    for (const d of deviceCreds) {
+    for (const d of ownedDevices) {
       if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') count += 1
     }
     return count
-  }, [deviceConnectionById, deviceCreds])
+  }, [deviceConnectionById, ownedDevices])
 
   const deviceOnlineStatsByUser = useMemo(() => {
     const map: Record<string, { online: number; total: number }> = {}
     const ensure = (k: string) => (map[k] ??= { online: 0, total: 0 })
-    for (const d of deviceCreds) {
+    for (const d of ownedDevices) {
       const userId = toAccountKey(d.user_id)
       if (!userId) continue
       const s = ensure(userId)
@@ -326,13 +328,13 @@ export default function DashboardPage() {
       if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') s.online += 1
     }
     return map
-  }, [deviceConnectionById, deviceCreds, toAccountKey])
+  }, [deviceConnectionById, ownedDevices, toAccountKey])
 
   const mqttServerStatus = useMemo(() => {
     const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
     for (const row of mqttListVisible) map[row.server_no] = 'Unknown'
 
-    for (const d of deviceCreds) {
+    for (const d of ownedDevices) {
       const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
       if (!(no in map)) continue
       const s = deviceConnectionById[d.id] ?? 'Unknown'
@@ -340,7 +342,7 @@ export default function DashboardPage() {
       else if (s === 'Offline' && map[no] !== 'Online') map[no] = 'Offline'
     }
     return map
-  }, [deviceConnectionById, deviceCreds, mqttListVisible])
+  }, [deviceConnectionById, mqttListVisible, ownedDevices])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -558,7 +560,7 @@ export default function DashboardPage() {
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <div className="text-xs text-slate-400">設備</div>
-                <div className="mt-1 text-lg font-semibold text-cyan-200">{deviceCreds.length}</div>
+                <div className="mt-1 text-lg font-semibold text-cyan-200">{ownedDevices.length}</div>
               </div>
               <div>
                 <div className="text-xs text-slate-400">伺服器</div>
