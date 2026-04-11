@@ -242,6 +242,24 @@ export default function DashboardPage() {
     return userIds
   }, [getAccountAliases, registered])
 
+  const resolveSharedOwnerUserIds = useCallback((raw: unknown) => {
+    const userIds = new Set<string>()
+
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const shareFrom = String(d.share_from ?? '').trim()
+      if (!shareFrom) continue
+      if (!accountMatches(d.user_id, raw)) continue
+
+      const sharedOwnerIds = resolveRegisteredUserIds(shareFrom)
+      for (const userId of sharedOwnerIds) {
+        userIds.add(userId)
+      }
+    }
+
+    return userIds
+  }, [accountMatches, deviceCreds, resolveRegisteredUserIds])
+
   useEffect(() => {
     if (selectedAccount === 'all') return
     const normalized = toAccountKey(selectedAccount)
@@ -498,18 +516,7 @@ export default function DashboardPage() {
         return
       }
 
-      const fallbackOwnerIds = new Set<string>()
-      for (const d of deviceCreds) {
-        if (isIgnoredShareRow(d)) continue
-        const shareFrom = String(d.share_from ?? '').trim()
-        if (!shareFrom) continue
-        if (!accountMatches(d.user_id, selectedAccount)) continue
-
-        const sharedOwnerIds = resolveRegisteredUserIds(shareFrom)
-        for (const userId of sharedOwnerIds) {
-          fallbackOwnerIds.add(userId)
-        }
-      }
+      const fallbackOwnerIds = resolveSharedOwnerUserIds(selectedAccount)
 
       if (fallbackOwnerIds.size === 0) {
         setLocations([])
@@ -539,7 +546,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [accountMatches, deviceCreds, envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount])
+  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, resolveSharedOwnerUserIds, selectedAccount])
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
