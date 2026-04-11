@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
-import { LayersControl, MapContainer, TileLayer, Circle, CircleMarker, Popup, useMap } from 'react-leaflet'
+import { LayersControl, MapContainer, TileLayer, Circle, CircleMarker, Popup, Tooltip, useMap } from 'react-leaflet'
 
 type MarkerItem = {
   id: string
@@ -355,6 +355,13 @@ export function LeafletPositionsMap({
                   click: () => setActiveIndex(idx),
                 }}
               >
+                {l.name ? (
+                  <Tooltip permanent direction="top" offset={[0, -10]} opacity={1}>
+                    <div className="rounded bg-slate-950/90 px-2 py-1 text-xs text-slate-100 shadow">
+                      {l.name}
+                    </div>
+                  </Tooltip>
+                ) : null}
                 <Popup>
                   <div className="text-sm">
                     <div className="font-semibold">{l.name ?? '定位點'}</div>
