@@ -445,21 +445,9 @@ export default function DashboardPage() {
       setLocationsError(null)
 
       const aliases = getAccountAliases(selectedAccount)
-      const candidateUserIds = resolveRegisteredUserIds(selectedAccount)
+      const primaryUserIds = resolveRegisteredUserIds(selectedAccount)
 
-      for (const d of deviceCreds) {
-        if (isIgnoredShareRow(d)) continue
-        const shareFrom = String(d.share_from ?? '').trim()
-        if (!shareFrom) continue
-        if (!accountMatches(d.user_id, selectedAccount)) continue
-
-        const sharedOwnerIds = resolveRegisteredUserIds(shareFrom)
-        for (const userId of sharedOwnerIds) {
-          candidateUserIds.add(userId)
-        }
-      }
-
-      if (candidateUserIds.size === 0 && aliases.email) {
+      if (primaryUserIds.size === 0 && aliases.email) {
         const res = await supabase
           .from('registered_emails')
           .select('user_id, email')
@@ -472,13 +460,13 @@ export default function DashboardPage() {
             const userId = String(row.user_id ?? '').trim()
             const email = String(row.email ?? '').trim()
             if (aliases.normalizedValues.has(email.toLowerCase()) && isUuid(userId)) {
-              candidateUserIds.add(userId)
+              primaryUserIds.add(userId)
             }
           }
         }
       }
 
-      if (candidateUserIds.size === 0) {
+      if (primaryUserIds.size === 0) {
         setLocations([])
         setLocationsError('查詢失敗（找不到可用的 user_id）')
         setLocationsLoading(false)
@@ -486,18 +474,62 @@ export default function DashboardPage() {
         return
       }
 
-      const res = await supabase
+      const primaryRes = await supabase
         .from('locations')
         .select('id,user_id,name,lat,lng,radius')
-        .in('user_id', Array.from(candidateUserIds))
+        .in('user_id', Array.from(primaryUserIds))
         .order('name', { ascending: true })
 
       if (cancelled) return
-      if (res.error) {
+
+      if (primaryRes.error) {
         setLocations([])
-        setLocationsError(res.error.message)
+        setLocationsError(primaryRes.error.message)
+        setLocationsLoading(false)
+        setActiveLocationIndex(0)
+        return
+      }
+
+      const primaryLocations = (primaryRes.data ?? []) as LocationRow[]
+      if (primaryLocations.length > 0) {
+        setLocations(primaryLocations)
+        setLocationsLoading(false)
+        setActiveLocationIndex(0)
+        return
+      }
+
+      const fallbackOwnerIds = new Set<string>()
+      for (const d of deviceCreds) {
+        if (isIgnoredShareRow(d)) continue
+        const shareFrom = String(d.share_from ?? '').trim()
+        if (!shareFrom) continue
+        if (!accountMatches(d.user_id, selectedAccount)) continue
+
+        const sharedOwnerIds = resolveRegisteredUserIds(shareFrom)
+        for (const userId of sharedOwnerIds) {
+          fallbackOwnerIds.add(userId)
+        }
+      }
+
+      if (fallbackOwnerIds.size === 0) {
+        setLocations([])
+        setLocationsLoading(false)
+        setActiveLocationIndex(0)
+        return
+      }
+
+      const fallbackRes = await supabase
+        .from('locations')
+        .select('id,user_id,name,lat,lng,radius')
+        .in('user_id', Array.from(fallbackOwnerIds))
+        .order('name', { ascending: true })
+
+      if (cancelled) return
+      if (fallbackRes.error) {
+        setLocations([])
+        setLocationsError(fallbackRes.error.message)
       } else {
-        setLocations((res.data ?? []) as LocationRow[])
+        setLocations((fallbackRes.data ?? []) as LocationRow[])
       }
       setLocationsLoading(false)
       setActiveLocationIndex(0)
