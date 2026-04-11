@@ -136,6 +136,17 @@ function ZoomReporter({ onZoomChange }: { onZoomChange?: (zoom: number) => void 
   return null
 }
 
+function FlyToActiveMarker({ active }: { active: MarkerItem | null }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!active) return
+    map.flyTo([active.lat, active.lng], map.getZoom(), { animate: true, duration: 0.7 })
+  }, [active, map])
+
+  return null
+}
+
 function FlyToActiveLocation({ active }: { active: LocationItem | null }) {
   const map = useMap()
 
@@ -203,6 +214,7 @@ export function LeafletPositionsMap({
   locations,
   activeLocationIndex,
   onActiveLocationIndexChange,
+  activeMarkerIndex,
   className,
   onZoomChange,
 }: {
@@ -210,6 +222,7 @@ export function LeafletPositionsMap({
   locations?: LocationItem[]
   activeLocationIndex?: number
   onActiveLocationIndexChange?: (index: number) => void
+  activeMarkerIndex?: number
   className?: string
   onZoomChange?: (zoom: number) => void
 }) {
@@ -229,6 +242,9 @@ export function LeafletPositionsMap({
   }, [activeIndex, safeLocations.length, setActiveIndex])
 
   const activeLocation = safeLocations.length ? safeLocations[Math.max(0, Math.min(activeIndex, safeLocations.length - 1))] : null
+  const activeMarker = (activeMarkerIndex != null && markers.length > 0)
+    ? markers[Math.max(0, Math.min(activeMarkerIndex, markers.length - 1))]
+    : null
 
   const center = useMemo(() => {
     if (activeLocation) return [activeLocation.lat, activeLocation.lng] as [number, number]
@@ -315,12 +331,17 @@ export function LeafletPositionsMap({
           onNext={onNext}
         />
         <FlyToActiveLocation active={activeLocation} />
-        {markers.map((m) => (
+        <FlyToActiveMarker active={activeMarker} />
+        {markers.map((m, idx) => {
+          const isActive = activeMarkerIndex != null && idx === activeMarkerIndex
+          return (
           <CircleMarker
             key={m.id}
             center={[m.lat, m.lng]}
-            radius={7}
-            pathOptions={{ color: '#00E5FF', weight: 2, fillColor: '#00E5FF', fillOpacity: 0.35 }}
+            radius={isActive ? 10 : 7}
+            pathOptions={isActive
+              ? { color: '#FF6B35', weight: 3, fillColor: '#FF6B35', fillOpacity: 0.7 }
+              : { color: '#00E5FF', weight: 2, fillColor: '#00E5FF', fillOpacity: 0.35 }}
           >
             {m.title || m.subtitle ? (
               <Popup>
@@ -331,7 +352,8 @@ export function LeafletPositionsMap({
               </Popup>
             ) : null}
           </CircleMarker>
-        ))}
+          )
+        })}
         {safeLocations.map((l, idx) => {
           const isActive = idx === activeIndex
           const stroke = isActive ? '#F59E0B' : '#FBBF24'

@@ -137,7 +137,6 @@ export default function DashboardPage() {
   const [locationsLoading, setLocationsLoading] = useState(false)
   const [locationsError, setLocationsError] = useState<string | null>(null)
   const [activeLocationIndex, setActiveLocationIndex] = useState(0)
-  const [activePositionIndex, setActivePositionIndex] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -265,12 +264,10 @@ export default function DashboardPage() {
       if (!v || v === 'all') {
         setSelectedAccount('all')
         setSelectedAccountLocationUserIds([])
-        setActivePositionIndex(0)
         return
       }
 
       setSelectedAccount(v)
-      setActivePositionIndex(0)
 
       const userIds: string[] = []
 
@@ -518,16 +515,22 @@ export default function DashboardPage() {
       setAccountPositionsError(null)
 
       const candidates = new Set<string>()
+      const text = String(selectedAccount ?? '').trim()
+      console.debug('[positions] selectedAccount:', text, 'locationUserIds:', selectedAccountLocationUserIds, 'registered count:', registered.length)
+
+      // 第一優先：直接用 resolveRegisteredUserIds（從已載入的 registered state 查）
+      for (const id of resolveRegisteredUserIds(selectedAccount)) {
+        const v = String(id ?? '').trim()
+        if (v && isUuid(v)) candidates.add(v)
+      }
+
+      // 第二：從 selectedAccountLocationUserIds 補充
       for (const id of selectedAccountLocationUserIds) {
         const v = String(id ?? '').trim()
         if (v && isUuid(v)) candidates.add(v)
       }
-      if (candidates.size === 0) {
-        for (const id of resolveRegisteredUserIds(selectedAccount)) {
-          const v = String(id ?? '').trim()
-          if (v && isUuid(v)) candidates.add(v)
-        }
-      }
+
+      // 第三：從 deviceCreds 反查
       if (candidates.size === 0) {
         for (const d of deviceCreds) {
           if (isIgnoredShareRow(d)) continue
@@ -539,29 +542,26 @@ export default function DashboardPage() {
         }
       }
 
-      if (candidates.size === 0) {
-        const text = String(selectedAccount ?? '').trim()
-        if (text.includes('@')) {
-          const res = await supabase
-            .from('registered_emails')
-            .select('user_id, email')
-            .ilike('email', `%${text}%`)
-            .limit(5)
+      // 第四：用 email 精確查資料庫
+      if (candidates.size === 0 && text.includes('@')) {
+        const res = await supabase
+          .from('registered_emails')
+          .select('user_id')
+          .eq('email', text)
+          .limit(1)
+          .maybeSingle()
 
-          if (!cancelled && !res.error) {
-            const rows = (res.data ?? []) as RegisteredEmailRow[]
-            for (const row of rows) {
-              const userId = String(row.user_id ?? '').trim()
-              const email = String(row.email ?? '').trim()
-              if (email && email.toLowerCase() === text.toLowerCase() && isUuid(userId)) candidates.add(userId)
-            }
-          }
-        }
-        // 若 selectedAccount 本身是 UUID 但前面都沒加到（防呆）
-        if (candidates.size === 0 && isUuid(text)) {
-          candidates.add(text)
+        if (!cancelled && !res.error) {
+          const userId = String(res.data?.user_id ?? '').trim()
+          if (userId && isUuid(userId)) candidates.add(userId)
         }
       }
+
+      // 防呆：selectedAccount 本身是 UUID
+      if (candidates.size === 0 && isUuid(text)) {
+        candidates.add(text)
+      }
+      console.debug('[positions] candidates:', Array.from(candidates))
 
       if (candidates.size === 0) {
         if (!cancelled) {
@@ -585,7 +585,6 @@ export default function DashboardPage() {
         setAccountPositionsError(res.error.message)
       } else {
         setAccountPositions((res.data ?? []) as PositionRow[])
-        setActivePositionIndex(0)
       }
       setAccountPositionsLoading(false)
     }
@@ -622,12 +621,14 @@ export default function DashboardPage() {
 
       const aliases = getAccountAliases(selectedAccount)
       const primaryUserIds = new Set<string>()
+
+      // 第一優先：直接用 resolveRegisteredUserIds（從已載入的 registered state 查）
+      for (const id of resolveRegisteredUserIds(selectedAccount)) primaryUserIds.add(id)
+
+      // 第二：從 selectedAccountLocationUserIds 補充
       for (const id of selectedAccountLocationUserIds) {
         const v = String(id ?? '').trim()
         if (v && isUuid(v)) primaryUserIds.add(v)
-      }
-      if (primaryUserIds.size === 0) {
-        for (const id of resolveRegisteredUserIds(selectedAccount)) primaryUserIds.add(id)
       }
 
       if (primaryUserIds.size === 0) {
@@ -1213,7 +1214,6 @@ export default function DashboardPage() {
                 locations={locationItems}
                 activeLocationIndex={activeLocationIndex}
                 onActiveLocationIndexChange={setActiveLocationIndex}
-                activeMarkerIndex={positionsMarkers.length > 0 ? Math.max(0, Math.min(activePositionIndex, positionsMarkers.length - 1)) : undefined}
                 className="h-[420px] w-full overflow-hidden rounded-xl border border-slate-800/60"
               />
             )}
@@ -1221,24 +1221,6 @@ export default function DashboardPage() {
               <div>
                 最近 {selectedAccount === 'all' ? positions.length : accountPositions.length} 筆（每 30 秒自動刷新）
               </div>
-              {positionsMarkers.length > 1 && selectedAccount !== 'all' ? (
-                <div className="flex items-center gap-1">
-                  <button
-                    className="rounded px-1.5 py-0.5 text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-30"
-                    onClick={() => setActivePositionIndex((i) => Math.max(0, i - 1))}
-                    disabled={activePositionIndex <= 0}
-                  >{'<'}</button>
-                  <span className="text-slate-300">
-                    GPS {activePositionIndex + 1}/{positionsMarkers.length}
-                    {positionsMarkers[activePositionIndex]?.subtitle ? ` · ${positionsMarkers[activePositionIndex].subtitle}` : ''}
-                  </span>
-                  <button
-                    className="rounded px-1.5 py-0.5 text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-30"
-                    onClick={() => setActivePositionIndex((i) => Math.min(positionsMarkers.length - 1, i + 1))}
-                    disabled={activePositionIndex >= positionsMarkers.length - 1}
-                  >{'>'}</button>
-                </div>
-              ) : null}
               <div>定位點 {locationItems.length} 個</div>
               {locationItems.length ? <div>目前：{locationItems[Math.max(0, Math.min(activeLocationIndex, locationItems.length - 1))]?.name ?? '—'}</div> : null}
               {accountPositionsLoading ? <div>positions 讀取中…</div> : null}
