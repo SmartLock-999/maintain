@@ -89,6 +89,11 @@ function isIgnoredShareRow(d: DeviceCredentialRow): boolean {
   return userId === deviceName
 }
 
+function isUuid(v: string): boolean {
+  const s = v.trim()
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)
+}
+
 function deviceIdentityKey(d: DeviceCredentialRow): string {
   const mqttUser = String(d.mqtt_user ?? '').trim()
   const deviceName = String(d.device_name ?? '').trim()
@@ -363,11 +368,20 @@ export default function DashboardPage() {
       setLocationsError(null)
 
       const candidates = new Set<string>()
-      candidates.add(selectedAccount)
-      const email = userIdToEmail[selectedAccount]
-      if (email) candidates.add(email)
-      const mappedUserId = emailToUserId[String(selectedAccount).toLowerCase()]
-      if (mappedUserId) candidates.add(mappedUserId)
+      const selectedTrimmed = String(selectedAccount).trim()
+      if (isUuid(selectedTrimmed)) candidates.add(selectedTrimmed)
+      const email = userIdToEmail[selectedTrimmed]
+      const mappedUserId = emailToUserId[selectedTrimmed.toLowerCase()]
+      const idFromEmail = mappedUserId ?? null
+      if (idFromEmail && isUuid(idFromEmail)) candidates.add(idFromEmail)
+
+      if (candidates.size === 0) {
+        setLocations([])
+        setLocationsError('locations：查詢失敗（找不到可用的 user_id）')
+        setLocationsLoading(false)
+        setActiveLocationIndex(0)
+        return
+      }
 
       const res = await supabase
         .from('locations')
