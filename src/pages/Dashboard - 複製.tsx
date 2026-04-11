@@ -142,7 +142,6 @@ export default function DashboardPage() {
 
   const connectivityRunRef = useRef(0)
   const connectivityRunningRef = useRef(false)
-  const serverCheckCursorRef = useRef(0)
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
   const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
 
@@ -788,7 +787,7 @@ export default function DashboardPage() {
     if (envMissing.length) return
     if (!mqttListVisible.length) return
     const connectTimeoutMs = 8000
-    const intervalMs = 120_000
+    const intervalMs = 60_000
 
     let cancelled = false
 
@@ -835,8 +834,7 @@ export default function DashboardPage() {
           const msg = String((e as Error | undefined)?.message ?? '').toLowerCase()
           const authError =
             msg.includes('not authorized') || msg.includes('bad username') || msg.includes('identifier rejected')
-          if (authError) done(true)
-          else done(false)
+          done(authError)
         })
         client.on('close', () => {
           window.clearTimeout(t)
@@ -845,22 +843,11 @@ export default function DashboardPage() {
       })
 
     const run = async () => {
-      if (connectivityRunningRef.current) return
-
-      const onlineServers = new Set<number>()
-      for (const d of deviceCreds) {
-        if (isIgnoredShareRow(d)) continue
-        const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
-        if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') onlineServers.add(no)
+      for (const row of mqttListVisible) {
+        if (cancelled) return
+        if (!row.url?.trim()) continue
+        await checkServer(row.server_no, row.url)
       }
-
-      const candidates = mqttListVisible.filter((r) => r.url?.trim() && !onlineServers.has(r.server_no))
-      if (!candidates.length) return
-
-      const idx = serverCheckCursorRef.current % candidates.length
-      serverCheckCursorRef.current += 1
-      const row = candidates[idx]
-      if (row) await checkServer(row.server_no, row.url)
     }
 
     void run()
@@ -869,7 +856,7 @@ export default function DashboardPage() {
       cancelled = true
       window.clearInterval(t)
     }
-  }, [deviceConnectionById, deviceCreds, envMissing.length, mqttListVisible])
+  }, [deviceCreds, envMissing.length, mqttListVisible])
 
   useEffect(() => {
     if (envMissing.length) return
