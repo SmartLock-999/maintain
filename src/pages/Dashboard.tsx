@@ -174,6 +174,52 @@ export default function DashboardPage() {
     return mapped ?? v
   }, [emailToUserId])
 
+  const getAccountAliases = useCallback((raw: unknown) => {
+    const values = new Set<string>()
+    const normalizedValues = new Set<string>()
+    const push = (value: unknown) => {
+      const text = String(value ?? '').trim()
+      if (!text) return
+      values.add(text)
+      normalizedValues.add(text.toLowerCase())
+    }
+
+    const text = String(raw ?? '').trim()
+    if (!text) {
+      return {
+        values,
+        normalizedValues,
+        userId: '',
+        email: '',
+      }
+    }
+
+    const key = toAccountKey(text)
+    const email = userIdToEmail[key] ?? (text.includes('@') ? text : '')
+    const mappedUserId = emailToUserId[text.toLowerCase()] ?? (isUuid(key) ? key : '')
+
+    push(text)
+    push(key)
+    push(email)
+    push(mappedUserId)
+
+    return {
+      values,
+      normalizedValues,
+      userId: mappedUserId || (isUuid(key) ? key : ''),
+      email,
+    }
+  }, [emailToUserId, toAccountKey, userIdToEmail])
+
+  const accountMatches = useCallback((account: unknown, target: unknown) => {
+    const accountAliases = getAccountAliases(account)
+    const targetAliases = getAccountAliases(target)
+    for (const value of targetAliases.normalizedValues) {
+      if (accountAliases.normalizedValues.has(value)) return true
+    }
+    return false
+  }, [getAccountAliases])
+
   useEffect(() => {
     if (selectedAccount === 'all') return
     const normalized = toAccountKey(selectedAccount)
@@ -277,7 +323,7 @@ export default function DashboardPage() {
 
   const positionsMarkers = useMemo(() => {
     const filtered =
-      selectedAccount === 'all' ? positions : positions.filter((p) => toAccountKey(p.user_id) === selectedAccount)
+      selectedAccount === 'all' ? positions : positions.filter((p) => accountMatches(p.user_id, selectedAccount))
     return filtered
       .map((p) => {
         const lat = asNumber(p.lat)
@@ -294,7 +340,7 @@ export default function DashboardPage() {
         }
       })
       .filter(Boolean) as { id: string; lat: number; lng: number; title?: string; subtitle?: string }[]
-  }, [accountLabel, positions, selectedAccount, toAccountKey])
+  }, [accountLabel, accountMatches, positions, selectedAccount, toAccountKey])
 
   const locationItems = useMemo(() => {
     return locations
@@ -376,26 +422,43 @@ export default function DashboardPage() {
       setLocationsLoading(true)
       setLocationsError(null)
 
-      const selectedTrimmed = String(selectedAccount).trim()
-      let accountUuid: string | null = null
-      const selectedKey = toAccountKey(selectedTrimmed)
-      if (isUuid(selectedKey)) accountUuid = selectedKey
+      const aliases = getAccountAliases(selectedAccount)
+      const candidateUserIds = new Set<string>()
 
-      if (!accountUuid && selectedTrimmed.includes('@')) {
-        const res = await supabase
-          .from('registered_emails')
-          .select('user_id')
-          .ilike('email', selectedTrimmed)
-          .limit(1)
-          .maybeSingle()
+      if (aliases.userId && isUuid(aliases.userId)) candidateUserIds.add(aliases.userId)
 
-        if (!cancelled) {
-          const fetchedId = String(res.data?.user_id ?? '').trim()
-          if (fetchedId && isUuid(fetchedId)) accountUuid = fetchedId
+      for (const row of registered) {
+        const rowUserId = String(row.user_id ?? '').trim()
+        const rowEmail = String(row.email ?? '').trim()
+        if (!rowUserId) continue
+        if (
+          aliases.normalizedValues.has(rowUserId.toLowerCase()) ||
+          (rowEmail && aliases.normalizedValues.has(rowEmail.toLowerCase()))
+        ) {
+          if (isUuid(rowUserId)) candidateUserIds.add(rowUserId)
         }
       }
 
-      if (!accountUuid) {
+      if (candidateUserIds.size === 0 && aliases.email) {
+        const res = await supabase
+          .from('registered_emails')
+          .select('user_id, email')
+          .ilike('email', aliases.email)
+          .limit(5)
+
+        if (!cancelled) {
+          const rows = (res.data ?? []) as RegisteredEmailRow[]
+          for (const row of rows) {
+            const userId = String(row.user_id ?? '').trim()
+            const email = String(row.email ?? '').trim()
+            if (aliases.normalizedValues.has(email.toLowerCase()) && isUuid(userId)) {
+              candidateUserIds.add(userId)
+            }
+          }
+        }
+      }
+
+      if (candidateUserIds.size === 0) {
         setLocations([])
         setLocationsError('查詢失敗（找不到可用的 user_id）')
         setLocationsLoading(false)
@@ -406,7 +469,7 @@ export default function DashboardPage() {
       const res = await supabase
         .from('locations')
         .select('id,user_id,name,lat,lng,radius')
-        .eq('user_id', accountUuid)
+        .in('user_id', Array.from(candidateUserIds))
         .order('name', { ascending: true })
 
       if (cancelled) return
@@ -424,7 +487,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, selectedAccount, toAccountKey])
+  }, [envMissing.length, getAccountAliases, registered, selectedAccount])
 
   const registeredDeviceIds = useMemo(() => {
     const set = new Set<string>()
@@ -451,16 +514,14 @@ export default function DashboardPage() {
       if (isIgnoredShareRow(d)) continue
       const shareFrom = String(d.share_from ?? '').trim()
       if (shareFrom) continue
-      const ownerKey = toAccountKey(d.user_id)
-      if (ownerKey === selectedAccount) ownedDeviceIds.add(String(d.id ?? '').trim())
+      if (accountMatches(d.user_id, selectedAccount)) ownedDeviceIds.add(String(d.id ?? '').trim())
     }
 
     const visibleDeviceIds = new Set<string>(ownedDeviceIds)
     for (const d of deviceCreds) {
       if (isIgnoredShareRow(d)) continue
-      const recipientKey = toAccountKey(d.user_id)
       const shareFrom = String(d.share_from ?? '').trim()
-      if (recipientKey === selectedAccount && shareFrom) visibleDeviceIds.add(String(d.id ?? '').trim())
+      if (shareFrom && accountMatches(d.user_id, selectedAccount)) visibleDeviceIds.add(String(d.id ?? '').trim())
     }
 
     const out: DeviceCredentialRow[] = []
@@ -469,14 +530,14 @@ export default function DashboardPage() {
       if (!rows.length) continue
       const isOwned = ownedDeviceIds.has(id)
       const preferred = isOwned
-        ? rows.find((r) => toAccountKey(r.user_id) === selectedAccount && !String(r.share_from ?? '').trim())
-        : rows.find((r) => toAccountKey(r.user_id) === selectedAccount && String(r.share_from ?? '').trim())
+        ? rows.find((r) => accountMatches(r.user_id, selectedAccount) && !String(r.share_from ?? '').trim())
+        : rows.find((r) => accountMatches(r.user_id, selectedAccount) && String(r.share_from ?? '').trim())
       out.push(preferred ?? rows[0])
     }
 
     out.sort((a, b) => displayDeviceName(a).localeCompare(displayDeviceName(b)))
     return out
-  }, [deviceCreds, selectedAccount, toAccountKey])
+  }, [accountMatches, deviceCreds, selectedAccount])
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
