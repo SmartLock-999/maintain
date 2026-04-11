@@ -376,11 +376,25 @@ export default function DashboardPage() {
       if (idFromEmail && isUuid(idFromEmail)) candidates.add(idFromEmail)
 
       if (candidates.size === 0) {
-        setLocations([])
-        setLocationsError('locations：查詢失敗（找不到可用的 user_id）')
-        setLocationsLoading(false)
-        setActiveLocationIndex(0)
-        return
+        const res = await supabase
+          .from('registered_emails')
+          .select('user_id')
+          .ilike('email', selectedTrimmed)
+          .limit(1)
+          .maybeSingle()
+
+        if (!cancelled) {
+          const fetchedId = String(res.data?.user_id ?? '').trim()
+          if (fetchedId && isUuid(fetchedId)) candidates.add(fetchedId)
+        }
+
+        if (candidates.size === 0) {
+          setLocations([])
+          setLocationsError('查詢失敗（找不到可用的 user_id）')
+          setLocationsLoading(false)
+          setActiveLocationIndex(0)
+          return
+        }
       }
 
       const res = await supabase
