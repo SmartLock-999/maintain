@@ -91,7 +91,9 @@ function isIgnoredShareRow(d: DeviceCredentialRow): boolean {
 
 function isUuid(v: string): boolean {
   const s = v.trim()
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return true
+  if (/^[0-9a-f]{32}$/i.test(s)) return true
+  return false
 }
 
 function deviceIdentityKey(d: DeviceCredentialRow): string {
@@ -140,6 +142,7 @@ export default function DashboardPage() {
   const connectivityRunRef = useRef(0)
   const connectivityRunningRef = useRef(false)
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
+  const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
 
@@ -382,15 +385,18 @@ export default function DashboardPage() {
       if (idFromEmail && isUuid(idFromEmail)) candidates.add(idFromEmail)
 
       if (candidates.size === 0) {
+        const localId = emailToUserId[selectedTrimmed.toLowerCase()]
+        if (localId && isUuid(localId)) candidates.add(localId)
+
         const res = await supabase
           .from('registered_emails')
           .select('user_id')
           .ilike('email', selectedTrimmed)
-          .limit(1)
-          .maybeSingle()
+          .limit(5)
 
         if (!cancelled) {
-          const fetchedId = String(res.data?.user_id ?? '').trim()
+          const rows = (res.data ?? []) as Array<{ user_id?: string | null }>
+          const fetchedId = String(rows[0]?.user_id ?? '').trim()
           if (fetchedId && isUuid(fetchedId)) candidates.add(fetchedId)
         }
 
@@ -525,12 +531,23 @@ export default function DashboardPage() {
   }, [deviceConnectionById, selectedDevices])
 
   const allOnlineDevicesCount = useMemo(() => {
+    const rank = (s: 'Online' | 'Offline' | 'Unknown') => (s === 'Online' ? 3 : s === 'Offline' ? 2 : 1)
+    const best = new Map<string, 'Online' | 'Offline' | 'Unknown'>()
+
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const key = deviceIdentityKey(d)
+      const next = deviceConnectionById[d.id] ?? 'Unknown'
+      const prev = best.get(key)
+      if (!prev || rank(next) > rank(prev)) best.set(key, next)
+    }
+
     let count = 0
-    for (const id of registeredDeviceIds) {
-      if ((deviceConnectionById[id] ?? 'Unknown') === 'Online') count += 1
+    for (const s of best.values()) {
+      if (s === 'Online') count += 1
     }
     return count
-  }, [deviceConnectionById, registeredDeviceIds])
+  }, [deviceConnectionById, deviceCreds])
 
   const deviceOnlineStatsByUser = useMemo(() => {
     const map: Record<string, { online: number; total: number }> = {}
@@ -564,19 +581,86 @@ export default function DashboardPage() {
   }, [deviceConnectionById, deviceCreds, toAccountKey])
 
   const mqttServerStatus = useMemo(() => {
+    const nowMs = Date.now()
+    const ttlMs = 2 * 60_000
     const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
-    for (const row of mqttListVisible) map[row.server_no] = 'Unknown'
-
-    for (const d of deviceCreds) {
-      if (String(d.share_from ?? '').trim()) continue
-      const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
-      if (!(no in map)) continue
-      const s = deviceConnectionById[d.id] ?? 'Unknown'
-      if (s === 'Online') map[no] = 'Online'
-      else if (s === 'Offline' && map[no] !== 'Online') map[no] = 'Offline'
+    for (const row of mqttListVisible) {
+      const rec = serverOnlineByNo[row.server_no]
+      if (!rec) {
+        map[row.server_no] = 'Unknown'
+        continue
+      }
+      const stale = nowMs - rec.updatedAt > ttlMs
+      if (stale) {
+        map[row.server_no] = 'Unknown'
+        continue
+      }
+      map[row.server_no] = rec.online ? 'Online' : 'Offline'
     }
     return map
-  }, [deviceConnectionById, deviceCreds, mqttListVisible])
+  }, [mqttListVisible, serverOnlineByNo])
+
+  useEffect(() => {
+    if (envMissing.length) return
+    if (!mqttListVisible.length) return
+    const connectTimeoutMs = 8000
+    const intervalMs = 60_000
+
+    let cancelled = false
+
+    const checkServer = (serverNo: number, rawUrl: string) =>
+      new Promise<void>((resolve) => {
+        const url = normalizeBrokerUrl(rawUrl)
+        const client = mqtt.connect(url, {
+          reconnectPeriod: 0,
+          keepalive: 30,
+          clean: true,
+          connectTimeout: connectTimeoutMs,
+        })
+
+        let settled = false
+        const done = (online: boolean) => {
+          if (settled) return
+          settled = true
+          try {
+            client.end(true)
+          } catch {
+            void 0
+          }
+          if (!cancelled) setServerOnlineByNo((prev) => ({ ...prev, [serverNo]: { online, updatedAt: Date.now() } }))
+          resolve()
+        }
+
+        const t = window.setTimeout(() => done(false), connectTimeoutMs)
+        client.on('connect', () => {
+          window.clearTimeout(t)
+          done(true)
+        })
+        client.on('error', () => {
+          window.clearTimeout(t)
+          done(false)
+        })
+        client.on('close', () => {
+          window.clearTimeout(t)
+          if (!settled) done(false)
+        })
+      })
+
+    const run = async () => {
+      for (const row of mqttListVisible) {
+        if (cancelled) return
+        if (!row.url?.trim()) continue
+        await checkServer(row.server_no, row.url)
+      }
+    }
+
+    void run()
+    const t = window.setInterval(() => void run(), intervalMs)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [envMissing.length, mqttListVisible])
 
   useEffect(() => {
     if (envMissing.length) return
