@@ -242,24 +242,6 @@ export default function DashboardPage() {
     return userIds
   }, [getAccountAliases, registered])
 
-  const resolveSharedOwnerUserIds = useCallback((raw: unknown) => {
-    const userIds = new Set<string>()
-
-    for (const d of deviceCreds) {
-      if (isIgnoredShareRow(d)) continue
-      const shareFrom = String(d.share_from ?? '').trim()
-      if (!shareFrom) continue
-      if (!accountMatches(d.user_id, raw)) continue
-
-      const sharedOwnerIds = resolveRegisteredUserIds(shareFrom)
-      for (const userId of sharedOwnerIds) {
-        userIds.add(userId)
-      }
-    }
-
-    return userIds
-  }, [accountMatches, deviceCreds, resolveRegisteredUserIds])
-
   useEffect(() => {
     if (selectedAccount === 'all') return
     const normalized = toAccountKey(selectedAccount)
@@ -508,36 +490,7 @@ export default function DashboardPage() {
         return
       }
 
-      const primaryLocations = (primaryRes.data ?? []) as LocationRow[]
-      if (primaryLocations.length > 0) {
-        setLocations(primaryLocations)
-        setLocationsLoading(false)
-        setActiveLocationIndex(0)
-        return
-      }
-
-      const fallbackOwnerIds = resolveSharedOwnerUserIds(selectedAccount)
-
-      if (fallbackOwnerIds.size === 0) {
-        setLocations([])
-        setLocationsLoading(false)
-        setActiveLocationIndex(0)
-        return
-      }
-
-      const fallbackRes = await supabase
-        .from('locations')
-        .select('id,user_id,name,lat,lng,radius')
-        .in('user_id', Array.from(fallbackOwnerIds))
-        .order('name', { ascending: true })
-
-      if (cancelled) return
-      if (fallbackRes.error) {
-        setLocations([])
-        setLocationsError(fallbackRes.error.message)
-      } else {
-        setLocations((fallbackRes.data ?? []) as LocationRow[])
-      }
+      setLocations((primaryRes.data ?? []) as LocationRow[])
       setLocationsLoading(false)
       setActiveLocationIndex(0)
     }
@@ -546,7 +499,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, resolveSharedOwnerUserIds, selectedAccount])
+  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount])
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
@@ -580,10 +533,36 @@ export default function DashboardPage() {
       const rows = rowsById.get(id) ?? []
       if (!rows.length) continue
       const isOwned = ownedDeviceIds.has(id)
-      const preferred = isOwned
-        ? rows.find((r) => accountMatches(r.user_id, selectedAccount) && !String(r.share_from ?? '').trim())
-        : rows.find((r) => accountMatches(r.user_id, selectedAccount) && String(r.share_from ?? '').trim())
-      out.push(preferred ?? rows[0])
+      const ownerRow = rows.find((r) => !String(r.share_from ?? '').trim()) ?? null
+      const recipientShareRow = rows.find((r) => accountMatches(r.user_id, selectedAccount) && String(r.share_from ?? '').trim()) ?? null
+      const ownedRow = rows.find((r) => accountMatches(r.user_id, selectedAccount) && !String(r.share_from ?? '').trim()) ?? null
+
+      if (isOwned) {
+        out.push(ownedRow ?? ownerRow ?? rows[0])
+        continue
+      }
+
+      if (!recipientShareRow) {
+        out.push(rows[0])
+        continue
+      }
+
+      if (!ownerRow) {
+        out.push(recipientShareRow)
+        continue
+      }
+
+      out.push({
+        id: ownerRow.id,
+        user_id: recipientShareRow.user_id,
+        device_name: ownerRow.device_name ?? recipientShareRow.device_name,
+        device_name_initial: recipientShareRow.device_name_initial,
+        device_name_custom: recipientShareRow.device_name_custom,
+        mqtt_user: ownerRow.mqtt_user,
+        mqtt_pass: ownerRow.mqtt_pass,
+        server_no: ownerRow.server_no,
+        share_from: recipientShareRow.share_from,
+      })
     }
 
     out.sort((a, b) => displayDeviceName(a).localeCompare(displayDeviceName(b)))
