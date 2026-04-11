@@ -376,52 +376,26 @@ export default function DashboardPage() {
       setLocationsLoading(true)
       setLocationsError(null)
 
-      const candidates = new Set<string>()
       const selectedTrimmed = String(selectedAccount).trim()
+      let accountUuid: string | null = null
       const selectedKey = toAccountKey(selectedTrimmed)
-      if (isUuid(selectedKey)) candidates.add(selectedKey)
-      const email = userIdToEmail[selectedTrimmed]
-      const mappedUserId = emailToUserId[selectedTrimmed.toLowerCase()]
-      const idFromEmail = mappedUserId ?? null
-      if (idFromEmail && isUuid(idFromEmail)) candidates.add(idFromEmail)
+      if (isUuid(selectedKey)) accountUuid = selectedKey
 
-      if (candidates.size === 0) {
-        const localId = emailToUserId[selectedTrimmed.toLowerCase()]
-        if (localId && isUuid(localId)) candidates.add(localId)
-
+      if (!accountUuid && selectedTrimmed.includes('@')) {
         const res = await supabase
           .from('registered_emails')
           .select('user_id')
           .ilike('email', selectedTrimmed)
-          .limit(5)
+          .limit(1)
+          .maybeSingle()
 
         if (!cancelled) {
-          const rows = (res.data ?? []) as Array<{ user_id?: string | null }>
-          const fetchedId = String(rows[0]?.user_id ?? '').trim()
-          if (fetchedId && isUuid(fetchedId)) candidates.add(fetchedId)
-        }
-
-        if (candidates.size === 0) {
-          void 0
+          const fetchedId = String(res.data?.user_id ?? '').trim()
+          if (fetchedId && isUuid(fetchedId)) accountUuid = fetchedId
         }
       }
 
-      if (selectedKey) {
-        for (const d of deviceCreds) {
-          const recipientKey = toAccountKey(d.user_id)
-          const shareFrom = String(d.share_from ?? '').trim()
-          if (!shareFrom) continue
-
-          const isRecipientMatch =
-            recipientKey === selectedKey || String(d.user_id ?? '').trim().toLowerCase() === selectedTrimmed.toLowerCase()
-
-          if (!isRecipientMatch) continue
-          const ownerKey = toAccountKey(shareFrom)
-          if (isUuid(ownerKey)) candidates.add(ownerKey)
-        }
-      }
-
-      if (candidates.size === 0) {
+      if (!accountUuid) {
         setLocations([])
         setLocationsError('查詢失敗（找不到可用的 user_id）')
         setLocationsLoading(false)
@@ -432,7 +406,7 @@ export default function DashboardPage() {
       const res = await supabase
         .from('locations')
         .select('id,user_id,name,lat,lng,radius')
-        .in('user_id', Array.from(candidates))
+        .eq('user_id', accountUuid)
         .order('name', { ascending: true })
 
       if (cancelled) return
@@ -450,7 +424,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [deviceCreds, emailToUserId, envMissing.length, selectedAccount, toAccountKey, userIdToEmail])
+  }, [envMissing.length, selectedAccount, toAccountKey])
 
   const registeredDeviceIds = useMemo(() => {
     const set = new Set<string>()
@@ -551,23 +525,34 @@ export default function DashboardPage() {
   }, [deviceConnectionById, selectedDevices])
 
   const allOnlineDevicesCount = useMemo(() => {
-    const rank = (s: 'Online' | 'Offline' | 'Unknown') => (s === 'Online' ? 3 : s === 'Offline' ? 2 : 1)
+    let count = 0
     const best = new Map<string, 'Online' | 'Offline' | 'Unknown'>()
+    const rank = (s: 'Online' | 'Offline' | 'Unknown') => (s === 'Online' ? 3 : s === 'Offline' ? 2 : 1)
 
     for (const d of deviceCreds) {
       if (isIgnoredShareRow(d)) continue
-      const key = deviceIdentityKey(d)
+      const mqttUser = String(d.mqtt_user ?? '').trim()
+      if (!mqttUser) continue
       const next = deviceConnectionById[d.id] ?? 'Unknown'
-      const prev = best.get(key)
-      if (!prev || rank(next) > rank(prev)) best.set(key, next)
+      const prev = best.get(mqttUser)
+      if (!prev || rank(next) > rank(prev)) best.set(mqttUser, next)
     }
 
-    let count = 0
     for (const s of best.values()) {
       if (s === 'Online') count += 1
     }
     return count
   }, [deviceConnectionById, deviceCreds])
+
+  const totalDevicesCount = useMemo(() => {
+    const set = new Set<string>()
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const mqttUser = String(d.mqtt_user ?? '').trim()
+      if (mqttUser) set.add(mqttUser)
+    }
+    return set.size
+  }, [deviceCreds])
 
   const deviceOnlineStatsByUser = useMemo(() => {
     const map: Record<string, { online: number; total: number }> = {}
@@ -617,8 +602,16 @@ export default function DashboardPage() {
       }
       map[row.server_no] = rec.online ? 'Online' : 'Offline'
     }
+
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
+      const s = deviceConnectionById[d.id] ?? 'Unknown'
+      if (s === 'Online') map[no] = 'Online'
+    }
+
     return map
-  }, [mqttListVisible, serverOnlineByNo])
+  }, [deviceConnectionById, deviceCreds, mqttListVisible, serverOnlineByNo])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -870,7 +863,7 @@ export default function DashboardPage() {
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <div className="text-xs text-slate-400">設備</div>
-                <div className="mt-1 text-lg font-semibold text-cyan-200">{registeredDeviceIds.size}</div>
+                <div className="mt-1 text-lg font-semibold text-cyan-200">{totalDevicesCount}</div>
               </div>
               <div>
                 <div className="text-xs text-slate-400">伺服器</div>
