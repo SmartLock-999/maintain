@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { HashRouter as Router, Routes, Route, Navigate } from "react-router-dom";
 import AuthPage from "@/pages/Auth";
 import DashboardPage from "@/pages/Dashboard";
@@ -6,6 +7,18 @@ import { useAuthStore } from "@/stores/authStore";
 
 export default function App() {
   const session = useAuthStore((s) => s.session);
+
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      const { session, signOut } = useAuthStore.getState();
+      if (session) void signOut();
+    };
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+    };
+  }, []);
 
   return (
     <Router>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { LayersControl, MapContainer, TileLayer, Circle, CircleMarker, Popup, useMap } from 'react-leaflet'
 
 type MarkerItem = {
@@ -9,17 +9,47 @@ type MarkerItem = {
   subtitle?: string
 }
 
-function FitToMarkers({ markers }: { markers: MarkerItem[] }) {
+type LocationItem = {
+  id: string
+  lat: number
+  lng: number
+  name?: string
+  radiusM?: number | null
+}
+
+const MAP_ZOOM_STORAGE_KEY = 'smart-lock-console.map.zoom'
+
+function readStoredZoom(): number | null {
+  try {
+    const raw = window.localStorage.getItem(MAP_ZOOM_STORAGE_KEY)
+    if (!raw) return null
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : null
+  } catch {
+    return null
+  }
+}
+
+function persistZoom(zoom: number) {
+  try {
+    window.localStorage.setItem(MAP_ZOOM_STORAGE_KEY, String(zoom))
+  } catch {
+    void 0
+  }
+}
+
+function FitToPoints({ points, disabled }: { points: Array<{ lat: number; lng: number }>; disabled?: boolean }) {
   const map = useMap()
   const [didFit, setDidFit] = useState(false)
 
   useEffect(() => {
-    if (!markers.length) return
+    if (disabled) return
+    if (!points.length) return
     if (didFit) return
-    const latLngs = markers.map((m) => [m.lat, m.lng] as [number, number])
+    const latLngs = points.map((m) => [m.lat, m.lng] as [number, number])
     map.fitBounds(latLngs, { padding: [40, 40] })
     setDidFit(true)
-  }, [didFit, map, markers])
+  }, [didFit, disabled, map, points])
 
   return null
 }
@@ -87,18 +117,141 @@ function LocateControl() {
   )
 }
 
-export function LeafletPositionsMap({ markers, className }: { markers: MarkerItem[]; className?: string }) {
+function ZoomReporter({ onZoomChange }: { onZoomChange?: (zoom: number) => void }) {
+  const map = useMap()
+
+  useEffect(() => {
+    const onZoomEnd = () => {
+      const z = map.getZoom()
+      persistZoom(z)
+      onZoomChange?.(z)
+    }
+
+    map.on('zoomend', onZoomEnd)
+    return () => {
+      map.off('zoomend', onZoomEnd)
+    }
+  }, [map, onZoomChange])
+
+  return null
+}
+
+function FlyToActiveLocation({ active }: { active: LocationItem | null }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!active) return
+    map.flyTo([active.lat, active.lng], map.getZoom(), { animate: true, duration: 0.7 })
+  }, [active, map])
+
+  return null
+}
+
+function LocationSwitcher({
+  activeIndex,
+  total,
+  onPrev,
+  onNext,
+}: {
+  activeIndex: number
+  total: number
+  onPrev: () => void
+  onNext: () => void
+}) {
+  if (total <= 1) return null
+
+  return (
+    <div className="absolute left-1/2 top-3 z-[1000] -translate-x-1/2">
+      <div className="flex items-center gap-2 rounded-lg border border-slate-800/60 bg-slate-950/80 px-2 py-1 text-xs text-slate-100 shadow backdrop-blur">
+        <button
+          type="button"
+          onClick={onPrev}
+          className="rounded-md px-2 py-1 transition hover:bg-white/10"
+          aria-label="prev-location"
+          title="上一個定位點"
+        >
+          {'<'}
+        </button>
+        <div className="min-w-[56px] text-center tabular-nums">
+          {activeIndex + 1}/{total}
+        </div>
+        <button
+          type="button"
+          onClick={onNext}
+          className="rounded-md px-2 py-1 transition hover:bg-white/10"
+          aria-label="next-location"
+          title="下一個定位點"
+        >
+          {'>'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+export function LeafletPositionsMap({
+  markers,
+  locations,
+  activeLocationIndex,
+  onActiveLocationIndexChange,
+  className,
+  onZoomChange,
+}: {
+  markers: MarkerItem[]
+  locations?: LocationItem[]
+  activeLocationIndex?: number
+  onActiveLocationIndexChange?: (index: number) => void
+  className?: string
+  onZoomChange?: (zoom: number) => void
+}) {
+  const savedZoom = useMemo(() => readStoredZoom(), [])
+
+  const safeLocations = useMemo(() => locations ?? [], [locations])
+  const [internalActiveIndex, setInternalActiveIndex] = useState(0)
+  const activeIndex = activeLocationIndex ?? internalActiveIndex
+  const setActiveIndex = onActiveLocationIndexChange ?? setInternalActiveIndex
+
+  useEffect(() => {
+    if (!safeLocations.length) {
+      if (activeIndex !== 0) setActiveIndex(0)
+      return
+    }
+    if (activeIndex < 0 || activeIndex >= safeLocations.length) setActiveIndex(0)
+  }, [activeIndex, safeLocations.length, setActiveIndex])
+
+  const activeLocation = safeLocations.length ? safeLocations[Math.max(0, Math.min(activeIndex, safeLocations.length - 1))] : null
+
   const center = useMemo(() => {
+    if (activeLocation) return [activeLocation.lat, activeLocation.lng] as [number, number]
     const first = markers[0]
     if (first) return [first.lat, first.lng] as [number, number]
     return [22.6273, 120.3014] as [number, number]
-  }, [markers])
+  }, [activeLocation, markers])
+
+  const pointsToFit = useMemo(() => {
+    const points: Array<{ lat: number; lng: number }> = []
+    for (const m of markers) points.push({ lat: m.lat, lng: m.lng })
+    for (const l of safeLocations) points.push({ lat: l.lat, lng: l.lng })
+    return points
+  }, [markers, safeLocations])
+
+  const onPrev = useCallback(() => {
+    if (safeLocations.length <= 1) return
+    const next = (activeIndex - 1 + safeLocations.length) % safeLocations.length
+    setActiveIndex(next)
+  }, [activeIndex, safeLocations.length, setActiveIndex])
+
+  const onNext = useCallback(() => {
+    if (safeLocations.length <= 1) return
+    const next = (activeIndex + 1) % safeLocations.length
+    setActiveIndex(next)
+  }, [activeIndex, safeLocations.length, setActiveIndex])
 
   return (
     <div className={className}>
       <MapContainer
         center={center}
-        zoom={markers.length ? 13 : 12}
+        zoom={savedZoom ?? (markers.length || safeLocations.length ? 13 : 12)}
         className="h-full w-full"
         zoomControl={false}
         maxZoom={22}
@@ -142,8 +295,11 @@ export function LeafletPositionsMap({ markers, className }: { markers: MarkerIte
             />
           </LayersControl.BaseLayer>
         </LayersControl>
-        <FitToMarkers markers={markers} />
+        <FitToPoints points={pointsToFit} disabled={savedZoom != null} />
+        <ZoomReporter onZoomChange={onZoomChange} />
         <LocateControl />
+        <LocationSwitcher activeIndex={activeIndex} total={safeLocations.length} onPrev={onPrev} onNext={onNext} />
+        <FlyToActiveLocation active={activeLocation} />
         {markers.map((m) => (
           <CircleMarker
             key={m.id}
@@ -161,6 +317,42 @@ export function LeafletPositionsMap({ markers, className }: { markers: MarkerIte
             ) : null}
           </CircleMarker>
         ))}
+        {safeLocations.map((l, idx) => {
+          const isActive = idx === activeIndex
+          const stroke = isActive ? '#F59E0B' : '#FBBF24'
+          const fill = isActive ? '#F59E0B' : '#FBBF24'
+          const weight = isActive ? 3 : 2
+          const fillOpacity = isActive ? 0.22 : 0.12
+          return (
+            <Fragment key={l.id}>
+              {l.radiusM ? (
+                <Circle
+                  center={[l.lat, l.lng]}
+                  radius={l.radiusM}
+                  pathOptions={{ color: stroke, weight: 1, fillColor: fill, fillOpacity: 0.08 }}
+                />
+              ) : null}
+              <CircleMarker
+                center={[l.lat, l.lng]}
+                radius={8}
+                pathOptions={{ color: stroke, weight, fillColor: fill, fillOpacity }}
+                eventHandlers={{
+                  click: () => setActiveIndex(idx),
+                }}
+              >
+                <Popup>
+                  <div className="text-sm">
+                    <div className="font-semibold">{l.name ?? '定位點'}</div>
+                    <div className="text-xs opacity-80">
+                      {l.lat.toFixed(6)}, {l.lng.toFixed(6)}
+                    </div>
+                    {l.radiusM ? <div className="text-xs opacity-80">radius: {l.radiusM}m</div> : null}
+                  </div>
+                </Popup>
+              </CircleMarker>
+            </Fragment>
+          )
+        })}
       </MapContainer>
     </div>
   )

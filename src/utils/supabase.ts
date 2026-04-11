@@ -15,7 +15,7 @@ export function getEnvMissing(): string[] {
 
 export const supabase = createClient(supabaseUrl?.trim() || FALLBACK_URL, supabaseAnonKey?.trim() || FALLBACK_KEY, {
   auth: {
-    persistSession: true,
+    persistSession: false,
     autoRefreshToken: true,
   },
 })

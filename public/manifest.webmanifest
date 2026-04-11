@@ -1,6 +1,6 @@
 {
-  "name": "Remote 維護",
-  "short_name": "Remote",
+  "name": "Smart Lock Console",
+  "short_name": "Smart Lock Console",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
