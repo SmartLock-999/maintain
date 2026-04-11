@@ -278,30 +278,46 @@ export default function DashboardPage() {
       }
 
       if (v.includes('@')) {
+        // 1. 先從已載入的 emailToUserId map 查（最快）
         const mapped = emailToUserId[v.toLowerCase()]
         if (mapped && isUuid(mapped)) userIds.push(mapped)
 
+        // 2. 若 map 裡找不到，用精確比對查資料庫
         if (!userIds.length) {
           const res = await supabase
             .from('registered_emails')
             .select('user_id')
-            .ilike('email', `%${v}%`)
+            .eq('email', v)
             .limit(1)
             .maybeSingle()
 
-          if (res.error) {
-            setSelectedAccountLocationUserIds([])
-            return
+          if (!res.error) {
+            const fetchedId = String(res.data?.user_id ?? '').trim()
+            if (fetchedId && isUuid(fetchedId)) userIds.push(fetchedId)
           }
+        }
 
-          const fetchedId = String(res.data?.user_id ?? '').trim()
-          if (fetchedId && isUuid(fetchedId)) userIds.push(fetchedId)
+        // 3. 若資料庫裡 user_id 是 null（帳號尚未建立），
+        //    也嘗試從 deviceCreds 以 email 反查 user_id
+        if (!userIds.length) {
+          for (const d of deviceCreds) {
+            if (isIgnoredShareRow(d)) continue
+            const rawUserId = String(d.user_id ?? '').trim()
+            // deviceCreds.user_id 有時直接儲存 email
+            if (rawUserId.toLowerCase() === v.toLowerCase() || accountMatches(rawUserId, v)) {
+              const key = toAccountKey(rawUserId)
+              if (key && isUuid(key)) { userIds.push(key); break }
+              if (rawUserId && isUuid(rawUserId)) { userIds.push(rawUserId); break }
+            }
+          }
         }
       }
 
+      // 即使 userIds 仍為空，也讓 selectedAccount 保持設定值，
+      // 讓後續 useEffect 透過 resolveRegisteredUserIds / deviceCreds fallback 繼續嘗試
       setSelectedAccountLocationUserIds(userIds)
     },
-    [emailToUserId],
+    [accountMatches, deviceCreds, emailToUserId, toAccountKey],
   )
 
   const accountLabel = useCallback((accountKey: string): string => {
@@ -538,6 +554,10 @@ export default function DashboardPage() {
             }
           }
         }
+        // 若 selectedAccount 本身是 UUID 但前面都沒加到（防呆）
+        if (candidates.size === 0 && isUuid(text)) {
+          candidates.add(text)
+        }
       }
 
       if (candidates.size === 0) {
@@ -618,22 +638,27 @@ export default function DashboardPage() {
       }
 
       if (primaryUserIds.size === 0 && aliases.email) {
+        // 精確比對 email
         const res = await supabase
           .from('registered_emails')
           .select('user_id, email')
-          .ilike('email', `%${aliases.email}%`)
+          .eq('email', aliases.email)
           .limit(5)
 
         if (!cancelled) {
           const rows = (res.data ?? []) as RegisteredEmailRow[]
           for (const row of rows) {
             const userId = String(row.user_id ?? '').trim()
-            const email = String(row.email ?? '').trim()
-            if (aliases.normalizedValues.has(email.toLowerCase()) && isUuid(userId)) {
+            if (isUuid(userId)) {
               primaryUserIds.add(userId)
             }
           }
         }
+      }
+
+      // 防呆：若 selectedAccount 本身是 UUID 且前面都沒查到，直接使用
+      if (primaryUserIds.size === 0 && isUuid(String(selectedAccount ?? '').trim())) {
+        primaryUserIds.add(String(selectedAccount).trim())
       }
 
       if (primaryUserIds.size === 0) {
