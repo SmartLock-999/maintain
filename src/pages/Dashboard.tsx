@@ -447,6 +447,18 @@ export default function DashboardPage() {
       const aliases = getAccountAliases(selectedAccount)
       const candidateUserIds = resolveRegisteredUserIds(selectedAccount)
 
+      for (const d of deviceCreds) {
+        if (isIgnoredShareRow(d)) continue
+        const shareFrom = String(d.share_from ?? '').trim()
+        if (!shareFrom) continue
+        if (!accountMatches(d.user_id, selectedAccount)) continue
+
+        const sharedOwnerIds = resolveRegisteredUserIds(shareFrom)
+        for (const userId of sharedOwnerIds) {
+          candidateUserIds.add(userId)
+        }
+      }
+
       if (candidateUserIds.size === 0 && aliases.email) {
         const res = await supabase
           .from('registered_emails')
@@ -495,7 +507,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount])
+  }, [accountMatches, deviceCreds, envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount])
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
