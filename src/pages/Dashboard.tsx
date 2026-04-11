@@ -130,6 +130,9 @@ export default function DashboardPage() {
   const [registered, setRegistered] = useState<RegisteredEmailRow[]>([])
   const [deviceCreds, setDeviceCreds] = useState<DeviceCredentialRow[]>([])
   const [positions, setPositions] = useState<PositionRow[]>([])
+  const [accountPositions, setAccountPositions] = useState<PositionRow[]>([])
+  const [accountPositionsLoading, setAccountPositionsLoading] = useState(false)
+  const [accountPositionsError, setAccountPositionsError] = useState<string | null>(null)
   const [locations, setLocations] = useState<LocationRow[]>([])
   const [locationsLoading, setLocationsLoading] = useState(false)
   const [locationsError, setLocationsError] = useState<string | null>(null)
@@ -397,9 +400,8 @@ export default function DashboardPage() {
   }, [deviceCreds, toAccountKey])
 
   const positionsMarkers = useMemo(() => {
-    const filtered =
-      selectedAccount === 'all' ? positions : positions.filter((p) => accountMatches(p.user_id, selectedAccount))
-    return filtered
+    const source = selectedAccount === 'all' ? positions : accountPositions
+    return source
       .map((p) => {
         const lat = asNumber(p.lat)
         const lng = asNumber(p.lng)
@@ -415,7 +417,7 @@ export default function DashboardPage() {
         }
       })
       .filter(Boolean) as { id: string; lat: number; lng: number; title?: string; subtitle?: string }[]
-  }, [accountLabel, accountMatches, positions, selectedAccount, toAccountKey])
+  }, [accountLabel, accountPositions, positions, selectedAccount, toAccountKey])
 
   const locationItems = useMemo(() => {
     return locations
@@ -481,6 +483,103 @@ export default function DashboardPage() {
       window.clearInterval(t)
     }
   }, [envMissing.length, refreshNonce])
+
+  useEffect(() => {
+    if (envMissing.length) return
+    if (selectedAccount === 'all') {
+      setAccountPositions([])
+      setAccountPositionsLoading(false)
+      setAccountPositionsError(null)
+      return
+    }
+
+    let cancelled = false
+    const run = async () => {
+      setAccountPositionsLoading(true)
+      setAccountPositionsError(null)
+
+      const candidates = new Set<string>()
+      for (const id of selectedAccountLocationUserIds) {
+        const v = String(id ?? '').trim()
+        if (v && isUuid(v)) candidates.add(v)
+      }
+      if (candidates.size === 0) {
+        for (const id of resolveRegisteredUserIds(selectedAccount)) {
+          const v = String(id ?? '').trim()
+          if (v && isUuid(v)) candidates.add(v)
+        }
+      }
+      if (candidates.size === 0) {
+        for (const d of deviceCreds) {
+          if (isIgnoredShareRow(d)) continue
+          if (!accountMatches(d.user_id, selectedAccount)) continue
+          const key = toAccountKey(d.user_id)
+          if (key && isUuid(key)) candidates.add(key)
+          const rawUserId = String(d.user_id ?? '').trim()
+          if (rawUserId && isUuid(rawUserId)) candidates.add(rawUserId)
+        }
+      }
+
+      if (candidates.size === 0) {
+        const text = String(selectedAccount ?? '').trim()
+        if (text.includes('@')) {
+          const res = await supabase
+            .from('registered_emails')
+            .select('user_id, email')
+            .ilike('email', `%${text}%`)
+            .limit(5)
+
+          if (!cancelled && !res.error) {
+            const rows = (res.data ?? []) as RegisteredEmailRow[]
+            for (const row of rows) {
+              const userId = String(row.user_id ?? '').trim()
+              const email = String(row.email ?? '').trim()
+              if (email && email.toLowerCase() === text.toLowerCase() && isUuid(userId)) candidates.add(userId)
+            }
+          }
+        }
+      }
+
+      if (candidates.size === 0) {
+        if (!cancelled) {
+          setAccountPositions([])
+          setAccountPositionsError('positions：查詢失敗（找不到可用的 user_id）')
+          setAccountPositionsLoading(false)
+        }
+        return
+      }
+
+      const res = await supabase
+        .from('positions')
+        .select('id, user_id, lat, lng, accuracy_m, captured_at, created_at')
+        .in('user_id', Array.from(candidates))
+        .order('captured_at', { ascending: false, nullsFirst: false })
+        .limit(200)
+
+      if (cancelled) return
+      if (res.error) {
+        setAccountPositions([])
+        setAccountPositionsError(res.error.message)
+      } else {
+        setAccountPositions((res.data ?? []) as PositionRow[])
+      }
+      setAccountPositionsLoading(false)
+    }
+
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    accountMatches,
+    deviceCreds,
+    emailToUserId,
+    envMissing.length,
+    resolveRegisteredUserIds,
+    selectedAccount,
+    selectedAccountLocationUserIds,
+    toAccountKey,
+  ])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -1089,9 +1188,13 @@ export default function DashboardPage() {
               />
             )}
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
-              <div>最近 {positions.length} 筆（每 30 秒自動刷新）</div>
+              <div>
+                最近 {selectedAccount === 'all' ? positions.length : accountPositions.length} 筆（每 30 秒自動刷新）
+              </div>
               <div>定位點 {locationItems.length} 個</div>
               {locationItems.length ? <div>目前：{locationItems[Math.max(0, Math.min(activeLocationIndex, locationItems.length - 1))]?.name ?? '—'}</div> : null}
+              {accountPositionsLoading ? <div>positions 讀取中…</div> : null}
+              {accountPositionsError ? <div className="text-rose-200">{accountPositionsError}</div> : null}
               {locationsLoading ? <div>locations 讀取中…</div> : null}
               {locationsError ? <div className="text-rose-200">locations：{locationsError}</div> : null}
             </div>
