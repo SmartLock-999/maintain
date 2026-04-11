@@ -171,6 +171,12 @@ export default function DashboardPage() {
     return mapped ?? v
   }, [emailToUserId])
 
+  useEffect(() => {
+    if (selectedAccount === 'all') return
+    const normalized = toAccountKey(selectedAccount)
+    if (normalized && normalized !== selectedAccount) setSelectedAccount(normalized)
+  }, [selectedAccount, toAccountKey])
+
   const accountLabel = useCallback((accountKey: string): string => {
     if (!accountKey) return '—'
     return userIdToEmail[accountKey] ?? accountKey
