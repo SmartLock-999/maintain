@@ -361,10 +361,18 @@ export default function DashboardPage() {
     const run = async () => {
       setLocationsLoading(true)
       setLocationsError(null)
+
+      const candidates = new Set<string>()
+      candidates.add(selectedAccount)
+      const email = userIdToEmail[selectedAccount]
+      if (email) candidates.add(email)
+      const mappedUserId = emailToUserId[String(selectedAccount).toLowerCase()]
+      if (mappedUserId) candidates.add(mappedUserId)
+
       const res = await supabase
         .from('locations')
         .select('id,user_id,name,lat,lng,radius')
-        .eq('user_id', selectedAccount)
+        .in('user_id', Array.from(candidates))
         .order('name', { ascending: true })
 
       if (cancelled) return
@@ -382,7 +390,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, selectedAccount])
+  }, [emailToUserId, envMissing.length, selectedAccount, userIdToEmail])
 
   const registeredDeviceIds = useMemo(() => {
     const set = new Set<string>()
