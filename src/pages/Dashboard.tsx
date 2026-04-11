@@ -220,6 +220,28 @@ export default function DashboardPage() {
     return false
   }, [getAccountAliases])
 
+  const resolveRegisteredUserIds = useCallback((raw: unknown) => {
+    const aliases = getAccountAliases(raw)
+    const userIds = new Set<string>()
+
+    if (aliases.userId && isUuid(aliases.userId)) userIds.add(aliases.userId)
+
+    for (const row of registered) {
+      const rowUserId = String(row.user_id ?? '').trim()
+      const rowEmail = String(row.email ?? '').trim()
+      if (!rowUserId || !isUuid(rowUserId)) continue
+
+      if (
+        aliases.normalizedValues.has(rowUserId.toLowerCase()) ||
+        (rowEmail && aliases.normalizedValues.has(rowEmail.toLowerCase()))
+      ) {
+        userIds.add(rowUserId)
+      }
+    }
+
+    return userIds
+  }, [getAccountAliases, registered])
+
   useEffect(() => {
     if (selectedAccount === 'all') return
     const normalized = toAccountKey(selectedAccount)
@@ -423,21 +445,7 @@ export default function DashboardPage() {
       setLocationsError(null)
 
       const aliases = getAccountAliases(selectedAccount)
-      const candidateUserIds = new Set<string>()
-
-      if (aliases.userId && isUuid(aliases.userId)) candidateUserIds.add(aliases.userId)
-
-      for (const row of registered) {
-        const rowUserId = String(row.user_id ?? '').trim()
-        const rowEmail = String(row.email ?? '').trim()
-        if (!rowUserId) continue
-        if (
-          aliases.normalizedValues.has(rowUserId.toLowerCase()) ||
-          (rowEmail && aliases.normalizedValues.has(rowEmail.toLowerCase()))
-        ) {
-          if (isUuid(rowUserId)) candidateUserIds.add(rowUserId)
-        }
-      }
+      const candidateUserIds = resolveRegisteredUserIds(selectedAccount)
 
       if (candidateUserIds.size === 0 && aliases.email) {
         const res = await supabase
@@ -487,15 +495,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, getAccountAliases, registered, selectedAccount])
-
-  const registeredDeviceIds = useMemo(() => {
-    const set = new Set<string>()
-    for (const d of deviceCreds) {
-      if (!String(d.share_from ?? '').trim()) set.add(d.id)
-    }
-    return set
-  }, [deviceCreds])
+  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount])
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
