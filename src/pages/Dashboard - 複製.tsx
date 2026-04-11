@@ -130,6 +130,9 @@ export default function DashboardPage() {
   const [registered, setRegistered] = useState<RegisteredEmailRow[]>([])
   const [deviceCreds, setDeviceCreds] = useState<DeviceCredentialRow[]>([])
   const [positions, setPositions] = useState<PositionRow[]>([])
+  const [accountPositions, setAccountPositions] = useState<PositionRow[]>([])
+  const [accountPositionsLoading, setAccountPositionsLoading] = useState(false)
+  const [accountPositionsError, setAccountPositionsError] = useState<string | null>(null)
   const [locations, setLocations] = useState<LocationRow[]>([])
   const [locationsLoading, setLocationsLoading] = useState(false)
   const [locationsError, setLocationsError] = useState<string | null>(null)
@@ -142,6 +145,7 @@ export default function DashboardPage() {
 
   const connectivityRunRef = useRef(0)
   const connectivityRunningRef = useRef(false)
+  const serverCheckCursorRef = useRef(0)
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
   const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
 
@@ -274,30 +278,46 @@ export default function DashboardPage() {
       }
 
       if (v.includes('@')) {
+        // 1. 先從已載入的 emailToUserId map 查（最快）
         const mapped = emailToUserId[v.toLowerCase()]
         if (mapped && isUuid(mapped)) userIds.push(mapped)
 
+        // 2. 若 map 裡找不到，用精確比對查資料庫
         if (!userIds.length) {
           const res = await supabase
             .from('registered_emails')
             .select('user_id')
-            .ilike('email', `%${v}%`)
+            .eq('email', v)
             .limit(1)
             .maybeSingle()
 
-          if (res.error) {
-            setSelectedAccountLocationUserIds([])
-            return
+          if (!res.error) {
+            const fetchedId = String(res.data?.user_id ?? '').trim()
+            if (fetchedId && isUuid(fetchedId)) userIds.push(fetchedId)
           }
+        }
 
-          const fetchedId = String(res.data?.user_id ?? '').trim()
-          if (fetchedId && isUuid(fetchedId)) userIds.push(fetchedId)
+        // 3. 若資料庫裡 user_id 是 null（帳號尚未建立），
+        //    也嘗試從 deviceCreds 以 email 反查 user_id
+        if (!userIds.length) {
+          for (const d of deviceCreds) {
+            if (isIgnoredShareRow(d)) continue
+            const rawUserId = String(d.user_id ?? '').trim()
+            // deviceCreds.user_id 有時直接儲存 email
+            if (rawUserId.toLowerCase() === v.toLowerCase() || accountMatches(rawUserId, v)) {
+              const key = toAccountKey(rawUserId)
+              if (key && isUuid(key)) { userIds.push(key); break }
+              if (rawUserId && isUuid(rawUserId)) { userIds.push(rawUserId); break }
+            }
+          }
         }
       }
 
+      // 即使 userIds 仍為空，也讓 selectedAccount 保持設定值，
+      // 讓後續 useEffect 透過 resolveRegisteredUserIds / deviceCreds fallback 繼續嘗試
       setSelectedAccountLocationUserIds(userIds)
     },
-    [emailToUserId],
+    [accountMatches, deviceCreds, emailToUserId, toAccountKey],
   )
 
   const accountLabel = useCallback((accountKey: string): string => {
@@ -396,9 +416,8 @@ export default function DashboardPage() {
   }, [deviceCreds, toAccountKey])
 
   const positionsMarkers = useMemo(() => {
-    const filtered =
-      selectedAccount === 'all' ? positions : positions.filter((p) => accountMatches(p.user_id, selectedAccount))
-    return filtered
+    const source = selectedAccount === 'all' ? positions : accountPositions
+    return source
       .map((p) => {
         const lat = asNumber(p.lat)
         const lng = asNumber(p.lng)
@@ -414,7 +433,7 @@ export default function DashboardPage() {
         }
       })
       .filter(Boolean) as { id: string; lat: number; lng: number; title?: string; subtitle?: string }[]
-  }, [accountLabel, accountMatches, positions, selectedAccount, toAccountKey])
+  }, [accountLabel, accountPositions, positions, selectedAccount, toAccountKey])
 
   const locationItems = useMemo(() => {
     return locations
@@ -484,6 +503,107 @@ export default function DashboardPage() {
   useEffect(() => {
     if (envMissing.length) return
     if (selectedAccount === 'all') {
+      setAccountPositions([])
+      setAccountPositionsLoading(false)
+      setAccountPositionsError(null)
+      return
+    }
+
+    let cancelled = false
+    const run = async () => {
+      setAccountPositionsLoading(true)
+      setAccountPositionsError(null)
+
+      const candidates = new Set<string>()
+      for (const id of selectedAccountLocationUserIds) {
+        const v = String(id ?? '').trim()
+        if (v && isUuid(v)) candidates.add(v)
+      }
+      if (candidates.size === 0) {
+        for (const id of resolveRegisteredUserIds(selectedAccount)) {
+          const v = String(id ?? '').trim()
+          if (v && isUuid(v)) candidates.add(v)
+        }
+      }
+      if (candidates.size === 0) {
+        for (const d of deviceCreds) {
+          if (isIgnoredShareRow(d)) continue
+          if (!accountMatches(d.user_id, selectedAccount)) continue
+          const key = toAccountKey(d.user_id)
+          if (key && isUuid(key)) candidates.add(key)
+          const rawUserId = String(d.user_id ?? '').trim()
+          if (rawUserId && isUuid(rawUserId)) candidates.add(rawUserId)
+        }
+      }
+
+      if (candidates.size === 0) {
+        const text = String(selectedAccount ?? '').trim()
+        if (text.includes('@')) {
+          const res = await supabase
+            .from('registered_emails')
+            .select('user_id, email')
+            .ilike('email', `%${text}%`)
+            .limit(5)
+
+          if (!cancelled && !res.error) {
+            const rows = (res.data ?? []) as RegisteredEmailRow[]
+            for (const row of rows) {
+              const userId = String(row.user_id ?? '').trim()
+              const email = String(row.email ?? '').trim()
+              if (email && email.toLowerCase() === text.toLowerCase() && isUuid(userId)) candidates.add(userId)
+            }
+          }
+        }
+        // 若 selectedAccount 本身是 UUID 但前面都沒加到（防呆）
+        if (candidates.size === 0 && isUuid(text)) {
+          candidates.add(text)
+        }
+      }
+
+      if (candidates.size === 0) {
+        if (!cancelled) {
+          setAccountPositions([])
+          setAccountPositionsError('positions：查詢失敗（找不到可用的 user_id）')
+          setAccountPositionsLoading(false)
+        }
+        return
+      }
+
+      const res = await supabase
+        .from('positions')
+        .select('id, user_id, lat, lng, accuracy_m, captured_at, created_at')
+        .in('user_id', Array.from(candidates))
+        .order('captured_at', { ascending: false, nullsFirst: false })
+        .limit(200)
+
+      if (cancelled) return
+      if (res.error) {
+        setAccountPositions([])
+        setAccountPositionsError(res.error.message)
+      } else {
+        setAccountPositions((res.data ?? []) as PositionRow[])
+      }
+      setAccountPositionsLoading(false)
+    }
+
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    accountMatches,
+    deviceCreds,
+    emailToUserId,
+    envMissing.length,
+    resolveRegisteredUserIds,
+    selectedAccount,
+    selectedAccountLocationUserIds,
+    toAccountKey,
+  ])
+
+  useEffect(() => {
+    if (envMissing.length) return
+    if (selectedAccount === 'all') {
       setLocations([])
       setLocationsError(null)
       setLocationsLoading(false)
@@ -518,22 +638,27 @@ export default function DashboardPage() {
       }
 
       if (primaryUserIds.size === 0 && aliases.email) {
+        // 精確比對 email
         const res = await supabase
           .from('registered_emails')
           .select('user_id, email')
-          .ilike('email', `%${aliases.email}%`)
+          .eq('email', aliases.email)
           .limit(5)
 
         if (!cancelled) {
           const rows = (res.data ?? []) as RegisteredEmailRow[]
           for (const row of rows) {
             const userId = String(row.user_id ?? '').trim()
-            const email = String(row.email ?? '').trim()
-            if (aliases.normalizedValues.has(email.toLowerCase()) && isUuid(userId)) {
+            if (isUuid(userId)) {
               primaryUserIds.add(userId)
             }
           }
         }
+      }
+
+      // 防呆：若 selectedAccount 本身是 UUID 且前面都沒查到，直接使用
+      if (primaryUserIds.size === 0 && isUuid(String(selectedAccount ?? '').trim())) {
+        primaryUserIds.add(String(selectedAccount).trim())
       }
 
       if (primaryUserIds.size === 0) {
@@ -787,7 +912,7 @@ export default function DashboardPage() {
     if (envMissing.length) return
     if (!mqttListVisible.length) return
     const connectTimeoutMs = 8000
-    const intervalMs = 60_000
+    const intervalMs = 120_000
 
     let cancelled = false
 
@@ -834,7 +959,8 @@ export default function DashboardPage() {
           const msg = String((e as Error | undefined)?.message ?? '').toLowerCase()
           const authError =
             msg.includes('not authorized') || msg.includes('bad username') || msg.includes('identifier rejected')
-          done(authError)
+          if (authError) done(true)
+          else done(false)
         })
         client.on('close', () => {
           window.clearTimeout(t)
@@ -843,11 +969,22 @@ export default function DashboardPage() {
       })
 
     const run = async () => {
-      for (const row of mqttListVisible) {
-        if (cancelled) return
-        if (!row.url?.trim()) continue
-        await checkServer(row.server_no, row.url)
+      if (connectivityRunningRef.current) return
+
+      const onlineServers = new Set<number>()
+      for (const d of deviceCreds) {
+        if (isIgnoredShareRow(d)) continue
+        const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
+        if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') onlineServers.add(no)
       }
+
+      const candidates = mqttListVisible.filter((r) => r.url?.trim() && !onlineServers.has(r.server_no))
+      if (!candidates.length) return
+
+      const idx = serverCheckCursorRef.current % candidates.length
+      serverCheckCursorRef.current += 1
+      const row = candidates[idx]
+      if (row) await checkServer(row.server_no, row.url)
     }
 
     void run()
@@ -856,7 +993,7 @@ export default function DashboardPage() {
       cancelled = true
       window.clearInterval(t)
     }
-  }, [deviceCreds, envMissing.length, mqttListVisible])
+  }, [deviceConnectionById, deviceCreds, envMissing.length, mqttListVisible])
 
   useEffect(() => {
     if (envMissing.length) return
@@ -1076,9 +1213,13 @@ export default function DashboardPage() {
               />
             )}
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
-              <div>最近 {positions.length} 筆（每 30 秒自動刷新）</div>
+              <div>
+                最近 {selectedAccount === 'all' ? positions.length : accountPositions.length} 筆（每 30 秒自動刷新）
+              </div>
               <div>定位點 {locationItems.length} 個</div>
               {locationItems.length ? <div>目前：{locationItems[Math.max(0, Math.min(activeLocationIndex, locationItems.length - 1))]?.name ?? '—'}</div> : null}
+              {accountPositionsLoading ? <div>positions 讀取中…</div> : null}
+              {accountPositionsError ? <div className="text-rose-200">{accountPositionsError}</div> : null}
               {locationsLoading ? <div>locations 讀取中…</div> : null}
               {locationsError ? <div className="text-rose-200">locations：{locationsError}</div> : null}
             </div>
