@@ -89,6 +89,13 @@ function isIgnoredShareRow(d: DeviceCredentialRow): boolean {
   return userId === deviceName
 }
 
+function deviceIdentityKey(d: DeviceCredentialRow): string {
+  const mqttUser = String(d.mqtt_user ?? '').trim()
+  const deviceName = String(d.device_name ?? '').trim()
+  if (mqttUser && deviceName) return `${mqttUser}::${deviceName}`
+  return String(d.id ?? '').trim()
+}
+
 function normalizeBrokerUrl(raw: string): string {
   const s = raw.trim()
   if (/^wss?:\/\//i.test(s)) return s
@@ -220,20 +227,19 @@ export default function DashboardPage() {
     const sharedOutBy: Record<string, Set<string>> = {}
     const ensure = (m: Record<string, Set<string>>, k: string) => (m[k] ??= new Set<string>())
 
-    for (const [deviceId, ownerKey] of deviceOwnershipById.entries()) {
-      ensure(ownedBy, ownerKey).add(deviceId)
-    }
-
     for (const d of deviceCreds) {
       if (isIgnoredShareRow(d)) continue
-      const deviceId = String(d.id ?? '').trim()
-      if (!deviceId) continue
       const shareFrom = String(d.share_from ?? '').trim()
-      if (!shareFrom) continue
-      const ownerKey = toAccountKey(shareFrom)
       const recipientKey = toAccountKey(d.user_id)
-      if (ownerKey) ensure(sharedOutBy, ownerKey).add(deviceId)
-      if (recipientKey) ensure(sharedInBy, recipientKey).add(deviceId)
+      const key = deviceIdentityKey(d)
+      if (shareFrom) {
+        const ownerKey = toAccountKey(shareFrom)
+        if (ownerKey) ensure(sharedOutBy, ownerKey).add(key)
+        if (recipientKey) ensure(sharedInBy, recipientKey).add(key)
+      } else {
+        const ownerKey = recipientKey
+        if (ownerKey) ensure(ownedBy, ownerKey).add(key)
+      }
     }
 
     const stats: Record<string, { owned: number; sharedIn: number; sharedOut: number; total: number }> = {}
@@ -253,7 +259,7 @@ export default function DashboardPage() {
       stats[key] = { owned, sharedIn, sharedOut, total }
     }
     return stats
-  }, [deviceCreds, deviceOwnershipById, toAccountKey])
+  }, [deviceCreds, toAccountKey])
 
   const positionsMarkers = useMemo(() => {
     const filtered =
@@ -399,8 +405,12 @@ export default function DashboardPage() {
     }
 
     const ownedDeviceIds = new Set<string>()
-    for (const [deviceId, ownerKey] of deviceOwnershipById.entries()) {
-      if (ownerKey === selectedAccount) ownedDeviceIds.add(deviceId)
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const shareFrom = String(d.share_from ?? '').trim()
+      if (shareFrom) continue
+      const ownerKey = toAccountKey(d.user_id)
+      if (ownerKey === selectedAccount) ownedDeviceIds.add(String(d.id ?? '').trim())
     }
 
     const visibleDeviceIds = new Set<string>(ownedDeviceIds)
@@ -424,7 +434,7 @@ export default function DashboardPage() {
 
     out.sort((a, b) => displayDeviceName(a).localeCompare(displayDeviceName(b)))
     return out
-  }, [deviceCreds, deviceOwnershipById, selectedAccount, toAccountKey])
+  }, [deviceCreds, selectedAccount, toAccountKey])
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
@@ -482,20 +492,32 @@ export default function DashboardPage() {
 
   const deviceOnlineStatsByUser = useMemo(() => {
     const map: Record<string, { online: number; total: number }> = {}
-    const ensure = (k: string) => (map[k] ??= { online: 0, total: 0 })
-    const seenByUser: Record<string, Set<string>> = {}
-    const ensureSeen = (k: string) => (seenByUser[k] ??= new Set<string>())
+
+    const rank = (s: 'Online' | 'Offline' | 'Unknown') => (s === 'Online' ? 3 : s === 'Offline' ? 2 : 1)
+    const bestStatusByUser: Record<string, Map<string, 'Online' | 'Offline' | 'Unknown'>> = {}
+    const ensureBest = (k: string) => (bestStatusByUser[k] ??= new Map<string, 'Online' | 'Offline' | 'Unknown'>())
+
     for (const d of deviceCreds) {
       if (isIgnoredShareRow(d)) continue
       const userKey = toAccountKey(d.user_id)
       if (!userKey) continue
-      const seen = ensureSeen(userKey)
-      if (seen.has(d.id)) continue
-      seen.add(d.id)
-      const s = ensure(userKey)
-      s.total += 1
-      if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') s.online += 1
+      const key = deviceIdentityKey(d)
+      const best = ensureBest(userKey)
+      const nextStatus = deviceConnectionById[d.id] ?? 'Unknown'
+      const prev = best.get(key)
+      if (!prev || rank(nextStatus) > rank(prev)) best.set(key, nextStatus)
     }
+
+    for (const [userKey, best] of Object.entries(bestStatusByUser)) {
+      let online = 0
+      let total = 0
+      for (const s of best.values()) {
+        total += 1
+        if (s === 'Online') online += 1
+      }
+      map[userKey] = { online, total }
+    }
+
     return map
   }, [deviceConnectionById, deviceCreds, toAccountKey])
 
