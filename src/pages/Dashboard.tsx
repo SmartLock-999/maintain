@@ -138,6 +138,7 @@ export default function DashboardPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
 
   const [selectedAccount, setSelectedAccount] = useState<string>('all')
+  const [selectedAccountLocationUserIds, setSelectedAccountLocationUserIds] = useState<string[]>([])
 
   const connectivityRunRef = useRef(0)
   const connectivityRunningRef = useRef(false)
@@ -224,6 +225,9 @@ export default function DashboardPage() {
     const aliases = getAccountAliases(raw)
     const userIds = new Set<string>()
 
+    const direct = String(raw ?? '').trim()
+    if (direct && isUuid(direct)) userIds.add(direct)
+
     if (aliases.userId && isUuid(aliases.userId)) userIds.add(aliases.userId)
 
     for (const row of registered) {
@@ -242,11 +246,51 @@ export default function DashboardPage() {
     return userIds
   }, [getAccountAliases, registered])
 
-  useEffect(() => {
-    if (selectedAccount === 'all') return
-    const normalized = toAccountKey(selectedAccount)
-    if (normalized && normalized !== selectedAccount) setSelectedAccount(normalized)
-  }, [selectedAccount, toAccountKey])
+  const selectAccount = useCallback(
+    async (raw: string) => {
+      const v = String(raw ?? '').trim()
+      if (!v || v === 'all') {
+        setSelectedAccount('all')
+        setSelectedAccountLocationUserIds([])
+        return
+      }
+
+      setSelectedAccount(v)
+
+      const userIds: string[] = []
+
+      if (isUuid(v)) {
+        userIds.push(v)
+        setSelectedAccountLocationUserIds(userIds)
+        return
+      }
+
+      if (v.includes('@')) {
+        const mapped = emailToUserId[v.toLowerCase()]
+        if (mapped && isUuid(mapped)) userIds.push(mapped)
+
+        if (!userIds.length) {
+          const res = await supabase
+            .from('registered_emails')
+            .select('user_id')
+            .ilike('email', `%${v}%`)
+            .limit(1)
+            .maybeSingle()
+
+          if (res.error) {
+            setSelectedAccountLocationUserIds([])
+            return
+          }
+
+          const fetchedId = String(res.data?.user_id ?? '').trim()
+          if (fetchedId && isUuid(fetchedId)) userIds.push(fetchedId)
+        }
+      }
+
+      setSelectedAccountLocationUserIds(userIds)
+    },
+    [emailToUserId],
+  )
 
   const accountLabel = useCallback((accountKey: string): string => {
     if (!accountKey) return '—'
@@ -445,13 +489,20 @@ export default function DashboardPage() {
       setLocationsError(null)
 
       const aliases = getAccountAliases(selectedAccount)
-      const primaryUserIds = resolveRegisteredUserIds(selectedAccount)
+      const primaryUserIds = new Set<string>()
+      for (const id of selectedAccountLocationUserIds) {
+        const v = String(id ?? '').trim()
+        if (v && isUuid(v)) primaryUserIds.add(v)
+      }
+      if (primaryUserIds.size === 0) {
+        for (const id of resolveRegisteredUserIds(selectedAccount)) primaryUserIds.add(id)
+      }
 
       if (primaryUserIds.size === 0 && aliases.email) {
         const res = await supabase
           .from('registered_emails')
           .select('user_id, email')
-          .ilike('email', aliases.email)
+          .ilike('email', `%${aliases.email}%`)
           .limit(5)
 
         if (!cancelled) {
@@ -499,7 +550,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount])
+  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount, selectedAccountLocationUserIds])
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
@@ -926,7 +977,7 @@ export default function DashboardPage() {
             <div className="mt-3 space-y-2">
               <div className="flex items-center gap-2">
                 <div className="text-xs text-slate-400">選擇帳號</div>
-                <Select value={selectedAccount} onChange={(e) => setSelectedAccount(e.target.value)}>
+                <Select value={selectedAccount} onChange={(e) => void selectAccount(e.target.value)}>
                   <option value="all">請選擇…</option>
                   {accounts.map((a) => (
                     <option key={a.key} value={a.key}>
@@ -1078,7 +1129,7 @@ export default function DashboardPage() {
                     <tr
                       key={a.key}
                       className={`cursor-pointer text-sm hover:bg-white/5 ${isSelected ? 'bg-cyan-400/5 text-cyan-100' : 'text-slate-200'}`}
-                      onClick={() => setSelectedAccount(a.key)}
+                      onClick={() => void selectAccount(a.key)}
                     >
                       <td className="px-5 py-3">
                         <div className="font-mono text-xs">{a.label}</div>
@@ -1094,7 +1145,7 @@ export default function DashboardPage() {
                       <td className="px-5 py-3">
                         <button
                           className="text-cyan-200 underline decoration-cyan-400/30 underline-offset-4 hover:text-cyan-100"
-                          onClick={() => setSelectedAccount(a.key)}
+                          onClick={() => void selectAccount(a.key)}
                         >
                           {isSelected ? '已選取' : '選取'}
                         </button>
