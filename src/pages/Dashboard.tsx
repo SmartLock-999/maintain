@@ -378,7 +378,8 @@ export default function DashboardPage() {
 
       const candidates = new Set<string>()
       const selectedTrimmed = String(selectedAccount).trim()
-      if (isUuid(selectedTrimmed)) candidates.add(selectedTrimmed)
+      const selectedKey = toAccountKey(selectedTrimmed)
+      if (isUuid(selectedKey)) candidates.add(selectedKey)
       const email = userIdToEmail[selectedTrimmed]
       const mappedUserId = emailToUserId[selectedTrimmed.toLowerCase()]
       const idFromEmail = mappedUserId ?? null
@@ -401,12 +402,31 @@ export default function DashboardPage() {
         }
 
         if (candidates.size === 0) {
-          setLocations([])
-          setLocationsError('查詢失敗（找不到可用的 user_id）')
-          setLocationsLoading(false)
-          setActiveLocationIndex(0)
-          return
+          void 0
         }
+      }
+
+      if (selectedKey) {
+        for (const d of deviceCreds) {
+          const recipientKey = toAccountKey(d.user_id)
+          const shareFrom = String(d.share_from ?? '').trim()
+          if (!shareFrom) continue
+
+          const isRecipientMatch =
+            recipientKey === selectedKey || String(d.user_id ?? '').trim().toLowerCase() === selectedTrimmed.toLowerCase()
+
+          if (!isRecipientMatch) continue
+          const ownerKey = toAccountKey(shareFrom)
+          if (isUuid(ownerKey)) candidates.add(ownerKey)
+        }
+      }
+
+      if (candidates.size === 0) {
+        setLocations([])
+        setLocationsError('查詢失敗（找不到可用的 user_id）')
+        setLocationsLoading(false)
+        setActiveLocationIndex(0)
+        return
       }
 
       const res = await supabase
@@ -430,7 +450,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [emailToUserId, envMissing.length, selectedAccount, userIdToEmail])
+  }, [deviceCreds, emailToUserId, envMissing.length, selectedAccount, toAccountKey, userIdToEmail])
 
   const registeredDeviceIds = useMemo(() => {
     const set = new Set<string>()
@@ -611,7 +631,17 @@ export default function DashboardPage() {
     const checkServer = (serverNo: number, rawUrl: string) =>
       new Promise<void>((resolve) => {
         const url = normalizeBrokerUrl(rawUrl)
+        const creds = deviceCreds.find(
+          (d) =>
+            !isIgnoredShareRow(d) &&
+            (d.server_no ?? 1) === serverNo &&
+            String(d.mqtt_user ?? '').trim() &&
+            String(d.mqtt_pass ?? '').trim(),
+        )
+
         const client = mqtt.connect(url, {
+          username: creds?.mqtt_user ?? undefined,
+          password: creds?.mqtt_pass ?? undefined,
           reconnectPeriod: 0,
           keepalive: 30,
           clean: true,
@@ -636,9 +666,12 @@ export default function DashboardPage() {
           window.clearTimeout(t)
           done(true)
         })
-        client.on('error', () => {
+        client.on('error', (e) => {
           window.clearTimeout(t)
-          done(false)
+          const msg = String((e as Error | undefined)?.message ?? '').toLowerCase()
+          const authError =
+            msg.includes('not authorized') || msg.includes('bad username') || msg.includes('identifier rejected')
+          done(authError)
         })
         client.on('close', () => {
           window.clearTimeout(t)
@@ -660,7 +693,7 @@ export default function DashboardPage() {
       cancelled = true
       window.clearInterval(t)
     }
-  }, [envMissing.length, mqttListVisible])
+  }, [deviceCreds, envMissing.length, mqttListVisible])
 
   useEffect(() => {
     if (envMissing.length) return
