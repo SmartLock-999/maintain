@@ -227,6 +227,10 @@ export default function DashboardPage() {
 
     const direct = String(raw ?? '').trim()
     if (direct && isUuid(direct)) userIds.add(direct)
+    if (direct && direct.includes('@')) {
+      const mapped = emailToUserId[direct.toLowerCase()]
+      if (mapped && isUuid(mapped)) userIds.add(mapped)
+    }
 
     if (aliases.userId && isUuid(aliases.userId)) userIds.add(aliases.userId)
 
@@ -241,10 +245,14 @@ export default function DashboardPage() {
       ) {
         userIds.add(rowUserId)
       }
+
+      if (direct && direct.includes('@') && rowEmail && rowEmail.toLowerCase() === direct.toLowerCase()) {
+        userIds.add(rowUserId)
+      }
     }
 
     return userIds
-  }, [getAccountAliases, registered])
+  }, [emailToUserId, getAccountAliases, registered])
 
   const selectAccount = useCallback(
     async (raw: string) => {
@@ -498,6 +506,17 @@ export default function DashboardPage() {
         for (const id of resolveRegisteredUserIds(selectedAccount)) primaryUserIds.add(id)
       }
 
+      if (primaryUserIds.size === 0) {
+        for (const d of deviceCreds) {
+          if (isIgnoredShareRow(d)) continue
+          if (!accountMatches(d.user_id, selectedAccount)) continue
+          const key = toAccountKey(d.user_id)
+          if (key && isUuid(key)) primaryUserIds.add(key)
+          const rawUserId = String(d.user_id ?? '').trim()
+          if (rawUserId && isUuid(rawUserId)) primaryUserIds.add(rawUserId)
+        }
+      }
+
       if (primaryUserIds.size === 0 && aliases.email) {
         const res = await supabase
           .from('registered_emails')
@@ -550,7 +569,16 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [envMissing.length, getAccountAliases, resolveRegisteredUserIds, selectedAccount, selectedAccountLocationUserIds])
+  }, [
+    accountMatches,
+    deviceCreds,
+    envMissing.length,
+    getAccountAliases,
+    resolveRegisteredUserIds,
+    selectedAccount,
+    selectedAccountLocationUserIds,
+    toAccountKey,
+  ])
 
   const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
@@ -977,7 +1005,11 @@ export default function DashboardPage() {
             <div className="mt-3 space-y-2">
               <div className="flex items-center gap-2">
                 <div className="text-xs text-slate-400">選擇帳號</div>
-                <Select value={selectedAccount} onChange={(e) => void selectAccount(e.target.value)}>
+                <Select
+                  value={selectedAccount}
+                  onChange={(e) => void selectAccount(e.target.value)}
+                  className="h-8 w-[260px] max-w-full px-2 text-xs"
+                >
                   <option value="all">請選擇…</option>
                   {accounts.map((a) => (
                     <option key={a.key} value={a.key}>
