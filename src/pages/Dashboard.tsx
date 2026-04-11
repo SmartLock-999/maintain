@@ -80,6 +80,15 @@ function displayDeviceName(d: DeviceCredentialRow): string {
   return d.id
 }
 
+function isIgnoredShareRow(d: DeviceCredentialRow): boolean {
+  const shareFrom = String(d.share_from ?? '').trim()
+  if (!shareFrom) return false
+  const userId = String(d.user_id ?? '').trim()
+  const deviceName = String(d.device_name ?? '').trim()
+  if (!userId || !deviceName) return false
+  return userId === deviceName
+}
+
 function normalizeBrokerUrl(raw: string): string {
   const s = raw.trim()
   if (/^wss?:\/\//i.test(s)) return s
@@ -171,6 +180,7 @@ export default function DashboardPage() {
       if (key) s.add(key)
     }
     for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
       const key = toAccountKey(d.user_id)
       if (key) s.add(key)
     }
@@ -188,6 +198,7 @@ export default function DashboardPage() {
   const deviceOwnershipById = useMemo(() => {
     const map = new Map<string, string>()
     for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
       const deviceId = String(d.id ?? '').trim()
       if (!deviceId) continue
       const shareFrom = String(d.share_from ?? '').trim()
@@ -214,6 +225,7 @@ export default function DashboardPage() {
     }
 
     for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
       const deviceId = String(d.id ?? '').trim()
       if (!deviceId) continue
       const shareFrom = String(d.share_from ?? '').trim()
@@ -374,34 +386,45 @@ export default function DashboardPage() {
     return set
   }, [deviceCreds])
 
-  const selectedOwnedDevices = useMemo(() => {
+  const selectedDevices = useMemo(() => {
     if (selectedAccount === 'all') return []
-    const deviceIds: string[] = []
-    for (const [deviceId, ownerKey] of deviceOwnershipById.entries()) {
-      if (ownerKey === selectedAccount) deviceIds.push(deviceId)
-    }
-    if (!deviceIds.length) return []
 
     const rowsById = new Map<string, DeviceCredentialRow[]>()
     for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
       const id = String(d.id ?? '').trim()
       if (!id) continue
       if (!rowsById.has(id)) rowsById.set(id, [])
       rowsById.get(id)!.push(d)
     }
 
-    const selected: { device: DeviceCredentialRow; ownerKey: string }[] = []
-    for (const id of deviceIds) {
-      const rows = rowsById.get(id) ?? []
-      const preferred =
-        rows.find((r) => toAccountKey(r.user_id) === selectedAccount && !String(r.share_from ?? '').trim()) ?? rows[0]
-      if (!preferred) continue
-      selected.push({ device: preferred, ownerKey: selectedAccount })
+    const ownedDeviceIds = new Set<string>()
+    for (const [deviceId, ownerKey] of deviceOwnershipById.entries()) {
+      if (ownerKey === selectedAccount) ownedDeviceIds.add(deviceId)
     }
-    return selected
-  }, [deviceCreds, deviceOwnershipById, selectedAccount, toAccountKey])
 
-  const selectedDevices = useMemo(() => selectedOwnedDevices.map((x) => x.device), [selectedOwnedDevices])
+    const visibleDeviceIds = new Set<string>(ownedDeviceIds)
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const recipientKey = toAccountKey(d.user_id)
+      const shareFrom = String(d.share_from ?? '').trim()
+      if (recipientKey === selectedAccount && shareFrom) visibleDeviceIds.add(String(d.id ?? '').trim())
+    }
+
+    const out: DeviceCredentialRow[] = []
+    for (const id of visibleDeviceIds) {
+      const rows = rowsById.get(id) ?? []
+      if (!rows.length) continue
+      const isOwned = ownedDeviceIds.has(id)
+      const preferred = isOwned
+        ? rows.find((r) => toAccountKey(r.user_id) === selectedAccount && !String(r.share_from ?? '').trim())
+        : rows.find((r) => toAccountKey(r.user_id) === selectedAccount && String(r.share_from ?? '').trim())
+      out.push(preferred ?? rows[0])
+    }
+
+    out.sort((a, b) => displayDeviceName(a).localeCompare(displayDeviceName(b)))
+    return out
+  }, [deviceCreds, deviceOwnershipById, selectedAccount, toAccountKey])
 
   const mqttListVisible = useMemo(() => mqttList.filter((r) => r.url && r.url.trim()), [mqttList])
 
@@ -463,6 +486,7 @@ export default function DashboardPage() {
     const seenByUser: Record<string, Set<string>> = {}
     const ensureSeen = (k: string) => (seenByUser[k] ??= new Set<string>())
     for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
       const userKey = toAccountKey(d.user_id)
       if (!userKey) continue
       const seen = ensureSeen(userKey)
@@ -706,6 +730,7 @@ export default function DashboardPage() {
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
               <div>最近 {positions.length} 筆（每 30 秒自動刷新）</div>
               <div>定位點 {locationItems.length} 個</div>
+              {locationItems.length ? <div>目前：{locationItems[Math.max(0, Math.min(activeLocationIndex, locationItems.length - 1))]?.name ?? '—'}</div> : null}
               {locationsLoading ? <div>locations 讀取中…</div> : null}
               {locationsError ? <div className="text-rose-200">locations：{locationsError}</div> : null}
             </div>

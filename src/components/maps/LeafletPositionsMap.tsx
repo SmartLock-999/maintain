@@ -149,16 +149,20 @@ function FlyToActiveLocation({ active }: { active: LocationItem | null }) {
 
 function LocationSwitcher({
   activeIndex,
+  activeName,
   total,
   onPrev,
   onNext,
 }: {
   activeIndex: number
+  activeName?: string | null
   total: number
   onPrev: () => void
   onNext: () => void
 }) {
   if (total <= 1) return null
+
+  const name = String(activeName ?? '').trim()
 
   return (
     <div className="absolute left-1/2 top-3 z-[1000] -translate-x-1/2">
@@ -175,6 +179,11 @@ function LocationSwitcher({
         <div className="min-w-[56px] text-center tabular-nums">
           {activeIndex + 1}/{total}
         </div>
+        {name ? (
+          <div className="max-w-[180px] truncate text-slate-200" title={name}>
+            {name}
+          </div>
+        ) : null}
         <button
           type="button"
           onClick={onNext}
@@ -298,7 +307,13 @@ export function LeafletPositionsMap({
         <FitToPoints points={pointsToFit} disabled={savedZoom != null} />
         <ZoomReporter onZoomChange={onZoomChange} />
         <LocateControl />
-        <LocationSwitcher activeIndex={activeIndex} total={safeLocations.length} onPrev={onPrev} onNext={onNext} />
+        <LocationSwitcher
+          activeIndex={activeIndex}
+          activeName={activeLocation?.name ?? null}
+          total={safeLocations.length}
+          onPrev={onPrev}
+          onNext={onNext}
+        />
         <FlyToActiveLocation active={activeLocation} />
         {markers.map((m) => (
           <CircleMarker
