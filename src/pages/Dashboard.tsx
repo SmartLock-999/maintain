@@ -146,7 +146,6 @@ export default function DashboardPage() {
 
   const connectivityRunRef = useRef(0)
   const connectivityRunningRef = useRef(false)
-  const serverCheckCursorRef = useRef(0)
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
   const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
 
@@ -915,18 +914,21 @@ export default function DashboardPage() {
   useEffect(() => {
     if (envMissing.length) return
     if (!mqttListVisible.length) return
-    const connectTimeoutMs = 8000
-    const intervalMs = 120_000
+
+    // ── 策略：每次掃全部伺服器，不跳過，間隔縮短為 60s ──
+    const connectTimeoutMs = 6000
+    const intervalMs = 60_000
 
     let cancelled = false
 
     const checkServer = (serverNo: number, rawUrl: string) =>
       new Promise<void>((resolve) => {
         const url = normalizeBrokerUrl(rawUrl)
+        // 用該伺服器上的任一設備憑證連線（有憑證才能連大多數 broker）
         const creds = deviceCreds.find(
           (d) =>
             !isIgnoredShareRow(d) &&
-            (d.server_no ?? 1) === serverNo &&
+            (d.server_no != null && d.server_no > 0 ? d.server_no : 1) === serverNo &&
             String(d.mqtt_user ?? '').trim() &&
             String(d.mqtt_pass ?? '').trim(),
         )
@@ -934,8 +936,9 @@ export default function DashboardPage() {
         const client = mqtt.connect(url, {
           username: creds?.mqtt_user ?? undefined,
           password: creds?.mqtt_pass ?? undefined,
+          clientId: `maint_srv_${Math.random().toString(36).slice(2, 9)}`,
           reconnectPeriod: 0,
-          keepalive: 30,
+          keepalive: 10,
           clean: true,
           connectTimeout: connectTimeoutMs,
         })
@@ -944,51 +947,31 @@ export default function DashboardPage() {
         const done = (online: boolean) => {
           if (settled) return
           settled = true
-          try {
-            client.end(true)
-          } catch {
-            void 0
-          }
+          try { client.end(true) } catch { void 0 }
           if (!cancelled) setServerOnlineByNo((prev) => ({ ...prev, [serverNo]: { online, updatedAt: Date.now() } }))
           resolve()
         }
 
         const t = window.setTimeout(() => done(false), connectTimeoutMs)
-        client.on('connect', () => {
-          window.clearTimeout(t)
-          done(true)
-        })
+        client.on('connect', () => { window.clearTimeout(t); done(true) })
         client.on('error', (e) => {
           window.clearTimeout(t)
           const msg = String((e as Error | undefined)?.message ?? '').toLowerCase()
+          // 認證錯誤 → 伺服器仍然 Online，只是憑證問題
           const authError =
-            msg.includes('not authorized') || msg.includes('bad username') || msg.includes('identifier rejected')
-          if (authError) done(true)
-          else done(false)
+            msg.includes('not authorized') ||
+            msg.includes('bad username') ||
+            msg.includes('identifier rejected') ||
+            msg.includes('connection refused')
+          done(authError ? true : false)
         })
-        client.on('close', () => {
-          window.clearTimeout(t)
-          if (!settled) done(false)
-        })
+        client.on('close', () => { window.clearTimeout(t); if (!settled) done(false) })
       })
 
     const run = async () => {
       if (connectivityRunningRef.current) return
-
-      const onlineServers = new Set<number>()
-      for (const d of deviceCreds) {
-        if (isIgnoredShareRow(d)) continue
-        const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
-        if ((deviceConnectionById[d.id] ?? 'Unknown') === 'Online') onlineServers.add(no)
-      }
-
-      const candidates = mqttListVisible.filter((r) => r.url?.trim() && !onlineServers.has(r.server_no))
-      if (!candidates.length) return
-
-      const idx = serverCheckCursorRef.current % candidates.length
-      serverCheckCursorRef.current += 1
-      const row = candidates[idx]
-      if (row) await checkServer(row.server_no, row.url)
+      // 平行檢查所有伺服器（伺服器數量通常很少）
+      await Promise.all(mqttListVisible.map((s) => checkServer(s.server_no, s.url)))
     }
 
     void run()
@@ -997,14 +980,16 @@ export default function DashboardPage() {
       cancelled = true
       window.clearInterval(t)
     }
-  }, [deviceConnectionById, deviceCreds, envMissing.length, mqttListVisible])
+  }, [deviceCreds, envMissing.length, mqttListVisible])
 
   useEffect(() => {
     if (envMissing.length) return
     if (!deviceCreds.length) return
-    const maxConcurrency = 6
-    const connectTimeoutMs = 8000
-    const messageTimeoutMs = 5000
+
+    // ── 策略：比照網頁版，以 connect/error/close 事件快速判斷，再用 retain status 細判 ──
+    const maxConcurrency = 8      // 提高並行，加速初次掃描
+    const connectTimeoutMs = 6000 // 較原 8s 短，更快感知 Offline
+    const retainWaitMs = 1500     // 等 retain 訊息的最長時間
     const intervalMs = 60_000
 
     let cancelled = false
@@ -1024,6 +1009,7 @@ export default function DashboardPage() {
         const client = mqtt.connect(url, {
           username: d.mqtt_user,
           password: d.mqtt_pass,
+          clientId: `maint_${Math.random().toString(36).slice(2, 9)}`,
           reconnectPeriod: 0,
           keepalive: 30,
           clean: true,
@@ -1033,49 +1019,47 @@ export default function DashboardPage() {
         let settled = false
         const statusTopic = `device/${d.mqtt_user}/${d.device_name}/status`
 
-        const done = () => {
+        const setOnline = (online: boolean) => {
+          if (!cancelled && runId === connectivityRunRef.current) {
+            setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: { online, updatedAt: Date.now() } }))
+          }
+        }
+
+        const done = (online: boolean) => {
           if (settled) return
           settled = true
-          if (runId !== connectivityRunRef.current) {
-            try {
-              client.end(true)
-            } catch {
-              void 0
-            }
-            return resolve()
-          }
-          try {
-            client.end(true)
-          } catch {
-            void 0
-          }
+          setOnline(online)
+          try { client.end(true) } catch { void 0 }
           resolve()
         }
 
-        const onMessage = (topic: string, payload: Uint8Array) => {
-          if (topic !== statusTopic) return
-          const text = new TextDecoder().decode(payload)
-          const action = parseStatusAction(text)
-          const a = String(action ?? '').trim().toLowerCase()
-          const online = a !== 'offline' && a !== 'disconnected'
-          setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: { online, updatedAt: Date.now() } }))
-          done()
-        }
-
-        const t = window.setTimeout(() => {
-          done()
-        }, messageTimeoutMs)
+        // 連線超時保險
+        const connectTimer = window.setTimeout(() => done(false), connectTimeoutMs)
 
         client.on('connect', () => {
-          client.on('message', onMessage)
-          client.subscribe(statusTopic, { qos: 0 }, () => {
-            window.clearTimeout(t)
-            window.setTimeout(() => done(), messageTimeoutMs)
+          window.clearTimeout(connectTimer)
+          // 連上 broker = 至少 Online，等 retain 訊息做細判
+          const retainTimer = window.setTimeout(() => done(true), retainWaitMs)
+          client.subscribe(statusTopic, { qos: 0 })
+          client.on('message', (topic, payload) => {
+            if (topic !== statusTopic) return
+            window.clearTimeout(retainTimer)
+            const text = new TextDecoder().decode(payload)
+            const action = parseStatusAction(text)
+            const a = String(action ?? '').trim().toLowerCase()
+            done(a !== 'offline' && a !== 'disconnected')
           })
         })
 
-        client.on('error', () => done())
-        client.on('close', () => done())
+        client.on('error', () => {
+          window.clearTimeout(connectTimer)
+          if (!settled) done(false)
+        })
+
+        client.on('close', () => {
+          window.clearTimeout(connectTimer)
+          if (!settled) done(false)
+        })
       })
 
     const runBatch = async () => {
@@ -1084,7 +1068,10 @@ export default function DashboardPage() {
       const runId = Date.now()
       connectivityRunRef.current = runId
 
-      const queue = deviceCreds.slice()
+      // 只跑有完整憑證的設備
+      const queue = deviceCreds.filter(
+        (d) => d.mqtt_user && d.mqtt_pass && d.device_name && mqttMap[d.server_no != null && d.server_no > 0 ? d.server_no : 1]
+      )
       const workers = Array.from({ length: Math.min(maxConcurrency, queue.length) }, async () => {
         while (queue.length && !cancelled && connectivityRunRef.current === runId) {
           const d = queue.shift()

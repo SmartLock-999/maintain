@@ -137,6 +137,7 @@ export default function DashboardPage() {
   const [locationsLoading, setLocationsLoading] = useState(false)
   const [locationsError, setLocationsError] = useState<string | null>(null)
   const [activeLocationIndex, setActiveLocationIndex] = useState(0)
+  const [activePositionIndex, setActivePositionIndex] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -264,10 +265,12 @@ export default function DashboardPage() {
       if (!v || v === 'all') {
         setSelectedAccount('all')
         setSelectedAccountLocationUserIds([])
+        setActivePositionIndex(0)
         return
       }
 
       setSelectedAccount(v)
+      setActivePositionIndex(0)
 
       const userIds: string[] = []
 
@@ -582,6 +585,7 @@ export default function DashboardPage() {
         setAccountPositionsError(res.error.message)
       } else {
         setAccountPositions((res.data ?? []) as PositionRow[])
+        setActivePositionIndex(0)
       }
       setAccountPositionsLoading(false)
     }
@@ -1209,6 +1213,7 @@ export default function DashboardPage() {
                 locations={locationItems}
                 activeLocationIndex={activeLocationIndex}
                 onActiveLocationIndexChange={setActiveLocationIndex}
+                activeMarkerIndex={positionsMarkers.length > 0 ? Math.max(0, Math.min(activePositionIndex, positionsMarkers.length - 1)) : undefined}
                 className="h-[420px] w-full overflow-hidden rounded-xl border border-slate-800/60"
               />
             )}
@@ -1216,6 +1221,24 @@ export default function DashboardPage() {
               <div>
                 最近 {selectedAccount === 'all' ? positions.length : accountPositions.length} 筆（每 30 秒自動刷新）
               </div>
+              {positionsMarkers.length > 1 && selectedAccount !== 'all' ? (
+                <div className="flex items-center gap-1">
+                  <button
+                    className="rounded px-1.5 py-0.5 text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-30"
+                    onClick={() => setActivePositionIndex((i) => Math.max(0, i - 1))}
+                    disabled={activePositionIndex <= 0}
+                  >{'<'}</button>
+                  <span className="text-slate-300">
+                    GPS {activePositionIndex + 1}/{positionsMarkers.length}
+                    {positionsMarkers[activePositionIndex]?.subtitle ? ` · ${positionsMarkers[activePositionIndex].subtitle}` : ''}
+                  </span>
+                  <button
+                    className="rounded px-1.5 py-0.5 text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-30"
+                    onClick={() => setActivePositionIndex((i) => Math.min(positionsMarkers.length - 1, i + 1))}
+                    disabled={activePositionIndex >= positionsMarkers.length - 1}
+                  >{'>'}</button>
+                </div>
+              ) : null}
               <div>定位點 {locationItems.length} 個</div>
               {locationItems.length ? <div>目前：{locationItems[Math.max(0, Math.min(activeLocationIndex, locationItems.length - 1))]?.name ?? '—'}</div> : null}
               {accountPositionsLoading ? <div>positions 讀取中…</div> : null}
