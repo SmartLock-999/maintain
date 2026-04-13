@@ -125,6 +125,7 @@ export default function DashboardPage() {
   const user = useAuthStore((s) => s.user)
   const envMissing = useAuthStore((s) => s.envMissing)
   const [refreshNonce, setRefreshNonce] = useState(0)
+  const [mqttRefreshNonce, setMqttRefreshNonce] = useState(0)
 
   const [mqttList, setMqttList] = useState<MqttListRow[]>([])
   const [registered, setRegistered] = useState<RegisteredEmailRow[]>([])
@@ -792,7 +793,8 @@ export default function DashboardPage() {
       .map(([k, v]) => `${k}=${v}`)
       .join('|')
     return `${devPart}||${mapPart}`
-  }, [deviceCreds, mqttMap])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceCreds, mqttMap, mqttRefreshNonce])
   // ── 長連線 MQTT：仿網頁版，每個 server_no 一條持久連線 ──
   // ● 連上後訂閱所有設備的 status topic（retain 即時反映）
   // ● 分享設備（share_from 不為空）用主設備（owner）的憑證建連線與訂閱
@@ -1046,7 +1048,12 @@ export default function DashboardPage() {
           <h1 className="text-lg font-semibold tracking-wide">管理總覽</h1>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onClick={() => setRefreshNonce((v) => v + 1)} disabled={envMissing.length > 0}>
+          <Button variant="secondary" size="sm" onClick={() => {
+            setRefreshNonce((v) => v + 1)
+            setDeviceOnlineByDeviceId({})
+            setServerOnlineByNo({})
+            setMqttRefreshNonce((v) => v + 1)
+          }} disabled={envMissing.length > 0}>
             重新整理
           </Button>
         </div>
