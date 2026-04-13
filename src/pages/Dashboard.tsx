@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Users, Wifi } from 'lucide-react'
 import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
@@ -125,6 +125,7 @@ export default function DashboardPage() {
   const user = useAuthStore((s) => s.user)
   const envMissing = useAuthStore((s) => s.envMissing)
   const [refreshNonce, setRefreshNonce] = useState(0)
+  const [mqttRefreshNonce, setMqttRefreshNonce] = useState(0)
 
   const [mqttList, setMqttList] = useState<MqttListRow[]>([])
   const [registered, setRegistered] = useState<RegisteredEmailRow[]>([])
@@ -144,9 +145,9 @@ export default function DashboardPage() {
   const [selectedAccount, setSelectedAccount] = useState<string>('all')
   const [selectedAccountLocationUserIds, setSelectedAccountLocationUserIds] = useState<string[]>([])
 
-  const connectivityRunRef = useRef(0)
-  const connectivityRunningRef = useRef(false)
+  // 長連線用：key = device.id，value = { online, updatedAt }
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
+  // 長連線用：key = server_no，value = { online, updatedAt }
   const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
@@ -280,11 +281,9 @@ export default function DashboardPage() {
       }
 
       if (v.includes('@')) {
-        // 1. 先從已載入的 emailToUserId map 查（最快）
         const mapped = emailToUserId[v.toLowerCase()]
         if (mapped && isUuid(mapped)) userIds.push(mapped)
 
-        // 2. 若 map 裡找不到，用精確比對查資料庫
         if (!userIds.length) {
           const res = await supabase
             .from('registered_emails')
@@ -299,13 +298,10 @@ export default function DashboardPage() {
           }
         }
 
-        // 3. 若資料庫裡 user_id 是 null（帳號尚未建立），
-        //    也嘗試從 deviceCreds 以 email 反查 user_id
         if (!userIds.length) {
           for (const d of deviceCreds) {
             if (isIgnoredShareRow(d)) continue
             const rawUserId = String(d.user_id ?? '').trim()
-            // deviceCreds.user_id 有時直接儲存 email
             if (rawUserId.toLowerCase() === v.toLowerCase() || accountMatches(rawUserId, v)) {
               const key = toAccountKey(rawUserId)
               if (key && isUuid(key)) { userIds.push(key); break }
@@ -315,8 +311,6 @@ export default function DashboardPage() {
         }
       }
 
-      // 即使 userIds 仍為空，也讓 selectedAccount 保持設定值，
-      // 讓後續 useEffect 透過 resolveRegisteredUserIds / deviceCreds fallback 繼續嘗試
       setSelectedAccountLocationUserIds(userIds)
     },
     [accountMatches, deviceCreds, emailToUserId, toAccountKey],
@@ -455,6 +449,7 @@ export default function DashboardPage() {
       .filter(Boolean) as { id: string; lat: number; lng: number; name?: string; radiusM?: number | null }[]
   }, [locations])
 
+  // ── 資料載入（Supabase）──
   useEffect(() => {
     if (envMissing.length) return
     let cancelled = false
@@ -502,6 +497,7 @@ export default function DashboardPage() {
     }
   }, [envMissing.length, refreshNonce])
 
+  // ── 帳號定位點載入 ──
   useEffect(() => {
     if (envMissing.length) return
     if (selectedAccount === 'all') {
@@ -556,7 +552,6 @@ export default function DashboardPage() {
             }
           }
         }
-        // 若 selectedAccount 本身是 UUID 但前面都沒加到（防呆）
         if (candidates.size === 0 && isUuid(text)) {
           candidates.add(text)
         }
@@ -604,6 +599,7 @@ export default function DashboardPage() {
     toAccountKey,
   ])
 
+  // ── 帳號定位點（locations 表）──
   useEffect(() => {
     if (envMissing.length) return
     if (selectedAccount === 'all') {
@@ -641,7 +637,6 @@ export default function DashboardPage() {
       }
 
       if (primaryUserIds.size === 0 && aliases.email) {
-        // 精確比對 email
         const res = await supabase
           .from('registered_emails')
           .select('user_id, email')
@@ -659,7 +654,6 @@ export default function DashboardPage() {
         }
       }
 
-      // 防呆：若 selectedAccount 本身是 UUID 且前面都沒查到，直接使用
       if (primaryUserIds.size === 0 && isUuid(String(selectedAccount ?? '').trim())) {
         primaryUserIds.add(String(selectedAccount).trim())
       }
@@ -786,18 +780,157 @@ export default function DashboardPage() {
     return m
   }, [mqttListVisible])
 
+
+  // stable key：只有設備憑證或 broker URL 真正改變時才重建長連線
+  const mqttStableKey = useMemo(() => {
+    const devPart = deviceCreds
+      .filter((d) => !isIgnoredShareRow(d) && d.mqtt_user && d.mqtt_pass && d.device_name)
+      .map((d) => `${d.id}:${d.mqtt_user}:${d.server_no}`)
+      .sort()
+      .join('|')
+    const mapPart = Object.entries(mqttMap)
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('|')
+    return `${devPart}||${mapPart}`
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceCreds, mqttMap, mqttRefreshNonce])
+  // ── 長連線 MQTT：仿網頁版，每個 server_no 一條持久連線 ──
+  // ● 連上後訂閱所有設備的 status topic（retain 即時反映）
+  // ● 分享設備（share_from 不為空）用主設備（owner）的憑證建連線與訂閱
+  // ● topic → device ids 映射：同一設備的主帳號 row 和分享 row 共用同一 id，
+  //   因此收到訊息後一次更新所有對應 id，主/分享帳號狀態自動同步
+  useEffect(() => {
+    if (envMissing.length) return
+    if (!deviceCreds.length || !Object.keys(mqttMap).length) return
+    // 1. 建立 owner row 查找表：key = `${mqtt_user}/${device_name}`
+    const ownerByTopicKey = new Map<string, DeviceCredentialRow>()
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      if (String(d.share_from ?? '').trim()) continue
+      const mqttUser = String(d.mqtt_user ?? '').trim()
+      const deviceName = String(d.device_name ?? '').trim()
+      if (mqttUser && deviceName && d.mqtt_pass) {
+        ownerByTopicKey.set(`${mqttUser}/${deviceName}`, d)
+      }
+    }
+
+    // 2. 按 server_no 分組，建立 topic → device ids 映射
+    //    同一個 topic 的主設備 row 和所有分享設備 row 的 id 通常相同，
+    //    這裡統一收集，確保一次更新所有相關 id
+    type ServerGroup = {
+      ownerCred: DeviceCredentialRow
+      topicsToIds: Map<string, string[]>
+    }
+    const groups = new Map<number, ServerGroup>()
+
+    for (const d of deviceCreds) {
+      if (isIgnoredShareRow(d)) continue
+      const mqttUser = String(d.mqtt_user ?? '').trim()
+      const deviceName = String(d.device_name ?? '').trim()
+      if (!mqttUser || !deviceName) continue
+
+      const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
+      if (!mqttMap[no]) continue
+
+      // 找這台設備的 owner row（有憑證）
+      const ownerRow = ownerByTopicKey.get(`${mqttUser}/${deviceName}`)
+      if (!ownerRow) continue
+
+      if (!groups.has(no)) {
+        groups.set(no, { ownerCred: ownerRow, topicsToIds: new Map() })
+      }
+      const group = groups.get(no)!
+
+      const topic = `device/${mqttUser}/${deviceName}/status`
+      if (!group.topicsToIds.has(topic)) group.topicsToIds.set(topic, [])
+      const ids = group.topicsToIds.get(topic)!
+      if (!ids.includes(d.id)) ids.push(d.id)
+    }
+
+    const cleanups: (() => void)[] = []
+    let mounted = true
+
+    for (const [no, group] of groups.entries()) {
+      const rawUrl = mqttMap[no]
+      if (!rawUrl) continue
+      const url = normalizeBrokerUrl(rawUrl)
+      const { ownerCred, topicsToIds } = group
+      if (!ownerCred.mqtt_user || !ownerCred.mqtt_pass) continue
+
+      let isActive = true
+
+      const client = mqtt.connect(url, {
+        username: ownerCred.mqtt_user,
+        password: ownerCred.mqtt_pass,
+        clientId: `maint_${no}_${Math.random().toString(36).slice(2, 8)}`,
+        reconnectPeriod: 5000,   // 長連線：斷線自動重連
+        keepalive: 30,
+        clean: true,
+      })
+
+      client.on('connect', () => {
+        if (!isActive || !mounted) return
+        setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: true, updatedAt: Date.now() } }))
+
+        // 訂閱所有設備的 status topic
+        const topics = Array.from(topicsToIds.keys())
+        if (topics.length) client.subscribe(topics, { qos: 0 })
+      })
+
+      client.on('message', (topic, payload) => {
+        if (!isActive || !mounted) return
+        const text = new TextDecoder().decode(payload).trim()
+        const action = parseStatusAction(text)
+        const a = String(action ?? '').trim().toLowerCase()
+        const online = a !== 'offline' && a !== 'disconnected'
+
+        // 更新所有對應此 topic 的 device ids（含主設備與分享設備）
+        const ids = topicsToIds.get(topic)
+        if (!ids) return
+        setDeviceOnlineByDeviceId((prev) => {
+          const next = { ...prev }
+          for (const id of ids) {
+            next[id] = { online, updatedAt: Date.now() }
+          }
+          return next
+        })
+      })
+
+      client.on('error', () => {
+        // auth 錯誤等不強制標記 Offline（可能只是憑證問題，伺服器仍在線）
+      })
+
+      client.on('close', () => {
+        if (!isActive || !mounted) return
+        setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
+      })
+
+      client.on('reconnect', () => {
+        if (!isActive || !mounted) return
+        // 重連中：暫時標記為 false，等 connect 事件再改回 true
+        setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
+      })
+
+      cleanups.push(() => {
+        isActive = false
+        try { client.end(true) } catch { void 0 }
+      })
+    }
+
+    return () => {
+      mounted = false
+      cleanups.forEach((fn) => fn())
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mqttStableKey, envMissing.length])
+
+  // ── 設備連線狀態（長連線策略：直接信任 message 事件，不需 TTL 強制失效）──
   const deviceConnectionById = useMemo(() => {
-    const nowMs = Date.now()
-    const ttlMs = 5 * 60_000
     const map: Record<string, 'Online' | 'Offline' | 'Unknown'> = {}
     for (const d of deviceCreds) {
       const rec = deviceOnlineByDeviceId[d.id]
       if (!rec) {
-        map[d.id] = 'Unknown'
-        continue
-      }
-      const stale = nowMs - rec.updatedAt > ttlMs
-      if (stale) {
         map[d.id] = 'Unknown'
         continue
       }
@@ -883,24 +1016,20 @@ export default function DashboardPage() {
     return map
   }, [deviceConnectionById, deviceCreds, toAccountKey])
 
+  // ── 伺服器狀態（長連線策略：直接信任 connect/close 事件）──
   const mqttServerStatus = useMemo(() => {
-    const nowMs = Date.now()
-    const ttlMs = 2 * 60_000
     const map: Record<number, 'Online' | 'Offline' | 'Unknown'> = {}
+
     for (const row of mqttListVisible) {
       const rec = serverOnlineByNo[row.server_no]
       if (!rec) {
         map[row.server_no] = 'Unknown'
-        continue
+      } else {
+        map[row.server_no] = rec.online ? 'Online' : 'Offline'
       }
-      const stale = nowMs - rec.updatedAt > ttlMs
-      if (stale) {
-        map[row.server_no] = 'Unknown'
-        continue
-      }
-      map[row.server_no] = rec.online ? 'Online' : 'Offline'
     }
 
+    // 保底：若有設備已確認 Online，對應伺服器至少是 Online
     for (const d of deviceCreds) {
       if (isIgnoredShareRow(d)) continue
       const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
@@ -911,187 +1040,6 @@ export default function DashboardPage() {
     return map
   }, [deviceConnectionById, deviceCreds, mqttListVisible, serverOnlineByNo])
 
-  useEffect(() => {
-    if (envMissing.length) return
-    if (!mqttListVisible.length) return
-
-    // ── 策略：每次掃全部伺服器，不跳過，間隔縮短為 60s ──
-    const connectTimeoutMs = 6000
-    const intervalMs = 60_000
-
-    let cancelled = false
-
-    const checkServer = (serverNo: number, rawUrl: string) =>
-      new Promise<void>((resolve) => {
-        const url = normalizeBrokerUrl(rawUrl)
-        // 用該伺服器上的任一設備憑證連線（有憑證才能連大多數 broker）
-        const creds = deviceCreds.find(
-          (d) =>
-            !isIgnoredShareRow(d) &&
-            (d.server_no != null && d.server_no > 0 ? d.server_no : 1) === serverNo &&
-            String(d.mqtt_user ?? '').trim() &&
-            String(d.mqtt_pass ?? '').trim(),
-        )
-
-        const client = mqtt.connect(url, {
-          username: creds?.mqtt_user ?? undefined,
-          password: creds?.mqtt_pass ?? undefined,
-          clientId: `maint_srv_${Math.random().toString(36).slice(2, 9)}`,
-          reconnectPeriod: 0,
-          keepalive: 10,
-          clean: true,
-          connectTimeout: connectTimeoutMs,
-        })
-
-        let settled = false
-        const done = (online: boolean) => {
-          if (settled) return
-          settled = true
-          try { client.end(true) } catch { void 0 }
-          if (!cancelled) setServerOnlineByNo((prev) => ({ ...prev, [serverNo]: { online, updatedAt: Date.now() } }))
-          resolve()
-        }
-
-        const t = window.setTimeout(() => done(false), connectTimeoutMs)
-        client.on('connect', () => { window.clearTimeout(t); done(true) })
-        client.on('error', (e) => {
-          window.clearTimeout(t)
-          const msg = String((e as Error | undefined)?.message ?? '').toLowerCase()
-          // 認證錯誤 → 伺服器仍然 Online，只是憑證問題
-          const authError =
-            msg.includes('not authorized') ||
-            msg.includes('bad username') ||
-            msg.includes('identifier rejected') ||
-            msg.includes('connection refused')
-          done(authError ? true : false)
-        })
-        client.on('close', () => { window.clearTimeout(t); if (!settled) done(false) })
-      })
-
-    const run = async () => {
-      if (connectivityRunningRef.current) return
-      // 平行檢查所有伺服器（伺服器數量通常很少）
-      await Promise.all(mqttListVisible.map((s) => checkServer(s.server_no, s.url)))
-    }
-
-    void run()
-    const t = window.setInterval(() => void run(), intervalMs)
-    return () => {
-      cancelled = true
-      window.clearInterval(t)
-    }
-  }, [deviceCreds, envMissing.length, mqttListVisible])
-
-  useEffect(() => {
-    if (envMissing.length) return
-    if (!deviceCreds.length) return
-
-    // ── 策略：比照網頁版，以 connect/error/close 事件快速判斷，再用 retain status 細判 ──
-    const maxConcurrency = 8      // 提高並行，加速初次掃描
-    const connectTimeoutMs = 6000 // 較原 8s 短，更快感知 Offline
-    const retainWaitMs = 1500     // 等 retain 訊息的最長時間
-    const intervalMs = 60_000
-
-    let cancelled = false
-
-    const checkOne = (d: DeviceCredentialRow, runId: number) =>
-      new Promise<void>((resolve) => {
-        if (cancelled) return resolve()
-        const deviceId = d.id
-
-        const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
-        const raw = mqttMap[no]
-        const url = raw ? normalizeBrokerUrl(raw) : null
-        if (!url || !raw?.trim()) return resolve()
-        if (!d.mqtt_user || !d.mqtt_pass) return resolve()
-        if (!d.device_name) return resolve()
-
-        const client = mqtt.connect(url, {
-          username: d.mqtt_user,
-          password: d.mqtt_pass,
-          clientId: `maint_${Math.random().toString(36).slice(2, 9)}`,
-          reconnectPeriod: 0,
-          keepalive: 30,
-          clean: true,
-          connectTimeout: connectTimeoutMs,
-        })
-
-        let settled = false
-        const statusTopic = `device/${d.mqtt_user}/${d.device_name}/status`
-
-        const setOnline = (online: boolean) => {
-          if (!cancelled && runId === connectivityRunRef.current) {
-            setDeviceOnlineByDeviceId((prev) => ({ ...prev, [deviceId]: { online, updatedAt: Date.now() } }))
-          }
-        }
-
-        const done = (online: boolean) => {
-          if (settled) return
-          settled = true
-          setOnline(online)
-          try { client.end(true) } catch { void 0 }
-          resolve()
-        }
-
-        // 連線超時保險
-        const connectTimer = window.setTimeout(() => done(false), connectTimeoutMs)
-
-        client.on('connect', () => {
-          window.clearTimeout(connectTimer)
-          // 連上 broker = 至少 Online，等 retain 訊息做細判
-          const retainTimer = window.setTimeout(() => done(true), retainWaitMs)
-          client.subscribe(statusTopic, { qos: 0 })
-          client.on('message', (topic, payload) => {
-            if (topic !== statusTopic) return
-            window.clearTimeout(retainTimer)
-            const text = new TextDecoder().decode(payload)
-            const action = parseStatusAction(text)
-            const a = String(action ?? '').trim().toLowerCase()
-            done(a !== 'offline' && a !== 'disconnected')
-          })
-        })
-
-        client.on('error', () => {
-          window.clearTimeout(connectTimer)
-          if (!settled) done(false)
-        })
-
-        client.on('close', () => {
-          window.clearTimeout(connectTimer)
-          if (!settled) done(false)
-        })
-      })
-
-    const runBatch = async () => {
-      if (connectivityRunningRef.current) return
-      connectivityRunningRef.current = true
-      const runId = Date.now()
-      connectivityRunRef.current = runId
-
-      // 只跑有完整憑證的設備
-      const queue = deviceCreds.filter(
-        (d) => d.mqtt_user && d.mqtt_pass && d.device_name && mqttMap[d.server_no != null && d.server_no > 0 ? d.server_no : 1]
-      )
-      const workers = Array.from({ length: Math.min(maxConcurrency, queue.length) }, async () => {
-        while (queue.length && !cancelled && connectivityRunRef.current === runId) {
-          const d = queue.shift()
-          if (!d) break
-          await checkOne(d, runId)
-        }
-      })
-      await Promise.all(workers)
-      if (!cancelled) connectivityRunningRef.current = false
-    }
-
-    void runBatch()
-    const t = window.setInterval(() => void runBatch(), intervalMs)
-    return () => {
-      cancelled = true
-      window.clearInterval(t)
-      connectivityRunningRef.current = false
-    }
-  }, [deviceCreds, envMissing.length, mqttMap])
-
   return (
     <AppShell>
       <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -1100,7 +1048,10 @@ export default function DashboardPage() {
           <h1 className="text-lg font-semibold tracking-wide">管理總覽</h1>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onClick={() => setRefreshNonce((v) => v + 1)} disabled={envMissing.length > 0}>
+          <Button variant="secondary" size="sm" onClick={() => {
+            setRefreshNonce((v) => v + 1)
+            setMqttRefreshNonce((v) => v + 1)
+          }} disabled={envMissing.length > 0}>
             重新整理
           </Button>
         </div>
@@ -1177,7 +1128,7 @@ export default function DashboardPage() {
               </div>
             </div>
             <div className="mt-2 text-xs text-slate-400">
-              來源：MQTT status topic（每 60 秒刷新，5 分鐘未更新視為未知）
+              來源：MQTT retain status topic（長連線，即時更新）
             </div>
           </CardContent>
         </Card>
@@ -1402,7 +1353,7 @@ export default function DashboardPage() {
               </table>
             </div>
           )}
-          <div className="mt-2 text-xs text-slate-400">連線狀態來源：device/&lt;mqtt_user&gt;/&lt;device_name&gt;/status（每 60 秒自動刷新）</div>
+          <div className="mt-2 text-xs text-slate-400">連線狀態來源：device/&lt;mqtt_user&gt;/&lt;device_name&gt;/status（長連線，retain 即時反映）</div>
         </CardContent>
       </Card>
     </AppShell>
