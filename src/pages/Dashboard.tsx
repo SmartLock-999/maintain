@@ -1050,8 +1050,6 @@ export default function DashboardPage() {
         <div className="flex items-center gap-2">
           <Button variant="secondary" size="sm" onClick={() => {
             setRefreshNonce((v) => v + 1)
-            setDeviceOnlineByDeviceId({})
-            setServerOnlineByNo({})
             setMqttRefreshNonce((v) => v + 1)
           }} disabled={envMissing.length > 0}>
             重新整理
