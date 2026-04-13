@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Users, Wifi } from 'lucide-react'
 import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
@@ -148,9 +148,6 @@ export default function DashboardPage() {
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
   // 長連線用：key = server_no，value = { online, updatedAt }
   const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
-
-  // 用來在 deviceCreds/mqttMap 變化時強制重建長連線
-  const mqttCredsKeyRef = useRef('')
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
 
@@ -782,6 +779,20 @@ export default function DashboardPage() {
     return m
   }, [mqttListVisible])
 
+
+  // stable key：只有設備憑證或 broker URL 真正改變時才重建長連線
+  const mqttStableKey = useMemo(() => {
+    const devPart = deviceCreds
+      .filter((d) => !isIgnoredShareRow(d) && d.mqtt_user && d.mqtt_pass && d.device_name)
+      .map((d) => `${d.id}:${d.mqtt_user}:${d.server_no}`)
+      .sort()
+      .join('|')
+    const mapPart = Object.entries(mqttMap)
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('|')
+    return `${devPart}||${mapPart}`
+  }, [deviceCreds, mqttMap])
   // ── 長連線 MQTT：仿網頁版，每個 server_no 一條持久連線 ──
   // ● 連上後訂閱所有設備的 status topic（retain 即時反映）
   // ● 分享設備（share_from 不為空）用主設備（owner）的憑證建連線與訂閱
@@ -790,17 +801,6 @@ export default function DashboardPage() {
   useEffect(() => {
     if (envMissing.length) return
     if (!deviceCreds.length || !Object.keys(mqttMap).length) return
-
-    // 計算本次 key，若與上次相同則不重建連線（避免 Supabase 30s 輪詢每次重建）
-    const credsKey = deviceCreds
-      .filter((d) => !isIgnoredShareRow(d) && d.mqtt_user && d.mqtt_pass && d.device_name)
-      .map((d) => `${d.id}:${d.mqtt_user}:${d.server_no}`)
-      .sort()
-      .join('|') + '||' + JSON.stringify(mqttMap)
-
-    if (credsKey === mqttCredsKeyRef.current) return
-    mqttCredsKeyRef.current = credsKey
-
     // 1. 建立 owner row 查找表：key = `${mqtt_user}/${device_name}`
     const ownerByTopicKey = new Map<string, DeviceCredentialRow>()
     for (const d of deviceCreds) {
@@ -920,7 +920,8 @@ export default function DashboardPage() {
       mounted = false
       cleanups.forEach((fn) => fn())
     }
-  }, [deviceCreds, envMissing.length, mqttMap])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mqttStableKey, envMissing.length])
 
   // ── 設備連線狀態（長連線策略：直接信任 message 事件，不需 TTL 強制失效）──
   const deviceConnectionById = useMemo(() => {
