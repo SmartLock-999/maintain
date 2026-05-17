@@ -795,14 +795,14 @@ export default function DashboardPage() {
     return `${devPart}||${mapPart}`
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceCreds, mqttMap, mqttRefreshNonce])
-  // ── 長連線 MQTT：每個 server_no 一條持久連線 ──
+  // ── 長連線 MQTT：仿網頁版，每個 server_no 一條持久連線 ──
   // ● 連上後訂閱所有設備的 status topic（retain 即時反映）
   // ● 分享設備（share_from 不為空）用主設備（owner）的憑證建連線與訂閱
-  // ● 無設備的伺服器改用「探測連線」偵測是否在線，不自動重連
+  // ● topic → device ids 映射：同一設備的主帳號 row 和分享 row 共用同一 id，
+  //   因此收到訊息後一次更新所有對應 id，主/分享帳號狀態自動同步
   useEffect(() => {
     if (envMissing.length) return
     if (!deviceCreds.length || !Object.keys(mqttMap).length) return
-
     // 1. 建立 owner row 查找表：key = `${mqtt_user}/${device_name}`
     const ownerByTopicKey = new Map<string, DeviceCredentialRow>()
     for (const d of deviceCreds) {
@@ -816,6 +816,8 @@ export default function DashboardPage() {
     }
 
     // 2. 按 server_no 分組，建立 topic → device ids 映射
+    //    同一個 topic 的主設備 row 和所有分享設備 row 的 id 通常相同，
+    //    這裡統一收集，確保一次更新所有相關 id
     type ServerGroup = {
       ownerCred: DeviceCredentialRow
       topicsToIds: Map<string, string[]>
@@ -831,6 +833,7 @@ export default function DashboardPage() {
       const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
       if (!mqttMap[no]) continue
 
+      // 找這台設備的 owner row（有憑證）
       const ownerRow = ownerByTopicKey.get(`${mqttUser}/${deviceName}`)
       if (!ownerRow) continue
 
@@ -848,7 +851,6 @@ export default function DashboardPage() {
     const cleanups: (() => void)[] = []
     let mounted = true
 
-    // 3. 主連線：有設備憑證的伺服器
     for (const [no, group] of groups.entries()) {
       const rawUrl = mqttMap[no]
       if (!rawUrl) continue
@@ -857,23 +859,21 @@ export default function DashboardPage() {
       if (!ownerCred.mqtt_user || !ownerCred.mqtt_pass) continue
 
       let isActive = true
-      let offlineTimer: ReturnType<typeof setTimeout> | null = null
 
       const client = mqtt.connect(url, {
         username: ownerCred.mqtt_user,
         password: ownerCred.mqtt_pass,
         clientId: `maint_${no}_${Math.random().toString(36).slice(2, 8)}`,
-        reconnectPeriod: 5000,
-        keepalive: 60,           // 提高心跳穩定性
-        connectTimeout: 15000,  // 初次連線超時
+        reconnectPeriod: 5000,   // 長連線：斷線自動重連
+        keepalive: 30,
         clean: true,
       })
 
       client.on('connect', () => {
         if (!isActive || !mounted) return
-        // 取消待處理的 offline 計時器（重連成功）
-        if (offlineTimer) { clearTimeout(offlineTimer); offlineTimer = null }
         setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: true, updatedAt: Date.now() } }))
+
+        // 訂閱所有設備的 status topic
         const topics = Array.from(topicsToIds.keys())
         if (topics.length) client.subscribe(topics, { qos: 0 })
       })
@@ -884,6 +884,8 @@ export default function DashboardPage() {
         const action = parseStatusAction(text)
         const a = String(action ?? '').trim().toLowerCase()
         const online = a !== 'offline' && a !== 'disconnected'
+
+        // 更新所有對應此 topic 的 device ids（含主設備與分享設備）
         const ids = topicsToIds.get(topic)
         if (!ids) return
         setDeviceOnlineByDeviceId((prev) => {
@@ -896,86 +898,24 @@ export default function DashboardPage() {
       })
 
       client.on('error', () => {
-        // auth / 憑證錯誤不強制標記 Offline
+        // auth 錯誤等不強制標記 Offline（可能只是憑證問題，伺服器仍在線）
       })
 
       client.on('close', () => {
         if (!isActive || !mounted) return
-        // 延遲 4 秒再標記 Offline，避免重連期間短暫閃爍
-        if (offlineTimer) clearTimeout(offlineTimer)
-        offlineTimer = setTimeout(() => {
-          if (!isActive || !mounted) return
-          setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
-        }, 4000)
+        setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
       })
 
-      // reconnect 事件不再立即標記 Offline（close 事件已有防抖處理）
+      client.on('reconnect', () => {
+        if (!isActive || !mounted) return
+        // 重連中：暫時標記為 false，等 connect 事件再改回 true
+        setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
+      })
 
       cleanups.push(() => {
         isActive = false
-        if (offlineTimer) { clearTimeout(offlineTimer); offlineTimer = null }
         try { client.end(true) } catch { void 0 }
       })
-    }
-
-    // 4. 探測連線：無設備的伺服器，用任一可用憑證探測 broker 是否回應
-    //    ● 連線成功（connect）→ 線上
-    //    ● Auth 被拒（error: not authorized）→ broker 有回應，視為線上
-    //    ● 其他錯誤 / close 未 settled → 視為離線
-    const fallbackCred = [...ownerByTopicKey.values()][0] ?? null
-    if (fallbackCred?.mqtt_user && fallbackCred?.mqtt_pass) {
-      for (const [noStr, rawUrl] of Object.entries(mqttMap)) {
-        const no = Number(noStr)
-        if (groups.has(no)) continue  // 已有主連線，略過
-
-        const url = normalizeBrokerUrl(rawUrl)
-        let isActive = true
-        let settled = false
-
-        const settle = (online: boolean) => {
-          if (settled || !mounted) return
-          settled = true
-          setServerOnlineByNo((prev) => ({ ...prev, [no]: { online, updatedAt: Date.now() } }))
-        }
-
-        const probe = mqtt.connect(url, {
-          username: fallbackCred.mqtt_user!,
-          password: fallbackCred.mqtt_pass!,
-          clientId: `probe_${no}_${Math.random().toString(36).slice(2, 8)}`,
-          reconnectPeriod: 0,     // 探測連線不自動重連
-          connectTimeout: 15000,
-          keepalive: 60,
-          clean: true,
-        })
-
-        probe.on('connect', () => {
-          if (!isActive) return
-          settle(true)
-          try { probe.end(true) } catch { void 0 }
-        })
-
-        probe.on('error', (err) => {
-          if (!isActive) return
-          const msg = String((err as Error).message ?? '').toLowerCase()
-          // HiveMQ 拒絕 auth 會回 CONNACK rc=5，broker 本身是在線的
-          if (msg.includes('not authorized') || msg.includes('connection refused')) {
-            settle(true)
-          } else {
-            settle(false)
-          }
-          try { probe.end(true) } catch { void 0 }
-        })
-
-        probe.on('close', () => {
-          if (!isActive) return
-          settle(false)  // 若尚未 settle，表示無法連線
-        })
-
-        cleanups.push(() => {
-          isActive = false
-          try { probe.end(true) } catch { void 0 }
-        })
-      }
     }
 
     return () => {
