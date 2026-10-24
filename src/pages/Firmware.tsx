@@ -807,6 +807,10 @@ export default function FirmwarePage() {
                               return <span className="text-blue-400">{log.message}</span>
                             }
 
+                            if (log.action === 'ota_retry') {
+                              return <span className="text-amber-400">{log.message || '準備重試…'}</span>
+                            }
+
                             const hasPercent = typeof log.percent === 'number'
                             const displayMsg = log.message || log.status || (log.action === 'ota_start' ? '開始更新' : '')
 
