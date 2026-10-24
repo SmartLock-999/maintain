@@ -365,7 +365,13 @@ export default function FirmwarePage() {
     }
 
     const pub = supabase.storage.from('firmware').getPublicUrl(selectedVersion.storage_path)
-    const url = pub.data.publicUrl
+    // 修正：ESP32 無法解析含有空格的 URL，且 Supabase Public URL 預設為 HTTPS
+    // 若設備端 WiFiClientSecure 憑證處理有問題，可考慮強制轉為 HTTP（但 Supabase 通常強制 HTTPS）
+    let url = pub.data.publicUrl
+    if (url) {
+      url = url.replace(/ /g, '%20')
+    }
+
     if (!url) {
       setSendMsg('無法取得韌體下載網址')
       return

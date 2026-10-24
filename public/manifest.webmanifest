@@ -1,8 +1,8 @@
 {
   "name": "Smart Lock Console",
-  "short_name": "Smart Lock Console",
-  "start_url": "./",
-  "scope": "./",
+  "short_name": "Smart Lock",
+  "start_url": "/index.html",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#0b1020",
   "theme_color": "#0b1020",
