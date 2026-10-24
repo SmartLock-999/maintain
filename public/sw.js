@@ -1,11 +1,11 @@
 const CACHE_NAME = 'smart-lock-v1';
 const ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.webmanifest',
-  '/maintain.png',
-  '/pwa-192.png',
-  '/pwa-512.png'
+  './',
+  './index.html',
+  './manifest.webmanifest',
+  './maintain.png',
+  './pwa-192.png',
+  './pwa-512.png'
 ];
 
 self.addEventListener('install', (event) => {

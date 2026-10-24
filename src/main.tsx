@@ -10,7 +10,8 @@ initAuth()
 // 註冊 Service Worker 以支援 PWA 離線與安裝功能
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(err => {
+    // 使用相對路徑以相容於 base: './'
+    navigator.serviceWorker.register('./sw.js').catch(err => {
       console.log('SW registration failed: ', err);
     });
   });
