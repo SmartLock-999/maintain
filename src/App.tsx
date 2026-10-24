@@ -3,6 +3,7 @@ import { HashRouter as Router, Routes, Route, Navigate } from "react-router-dom"
 import AuthPage from "@/pages/Auth";
 import DashboardPage from "@/pages/Dashboard";
 import DeviceDetailPage from "@/pages/DeviceDetail";
+import FirmwarePage from "@/pages/Firmware";
 import { useAuthStore } from "@/stores/authStore";
 
 export default function App() {
@@ -29,6 +30,7 @@ export default function App() {
           path="/devices/:deviceId"
           element={session ? <DeviceDetailPage /> : <Navigate to="/auth" replace />}
         />
+        <Route path="/firmware" element={session ? <FirmwarePage /> : <Navigate to="/auth" replace />} />
         <Route path="*" element={<Navigate to={session ? "/" : "/auth"} replace />} />
       </Routes>
     </Router>

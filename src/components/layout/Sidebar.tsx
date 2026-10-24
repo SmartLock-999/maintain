@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { Cpu, LayoutDashboard } from 'lucide-react'
+import { Cpu, HardDriveDownload, LayoutDashboard } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 
@@ -31,6 +31,19 @@ export function Sidebar() {
         >
           <LayoutDashboard className="h-4 w-4" />
           總覽
+        </NavLink>
+
+        <NavLink
+          to="/firmware"
+          className={({ isActive }) =>
+            cn(
+              'flex items-center gap-2 rounded-lg px-3 py-2 text-sm transition hover:bg-white/5',
+              isActive ? 'bg-white/5 text-cyan-100' : 'text-slate-300',
+            )
+          }
+        >
+          <HardDriveDownload className="h-4 w-4" />
+          韌體更新
         </NavLink>
       </div>
 

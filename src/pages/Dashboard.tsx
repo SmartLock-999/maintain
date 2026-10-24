@@ -9,6 +9,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge'
 import { useAuthStore } from '@/stores/authStore'
 import { supabase } from '@/utils/supabase'
 import { formatTs } from '@/utils/time'
+import { getBrokerCandidates, parsePortFromUrl, writeLastPort } from '@/utils/mqttBroker'
 import { LeafletPositionsMap } from '@/components/maps/LeafletPositionsMap'
 
 type RegisteredEmailRow = {
@@ -101,12 +102,6 @@ function deviceIdentityKey(d: DeviceCredentialRow): string {
   const deviceName = String(d.device_name ?? '').trim()
   if (mqttUser && deviceName) return `${mqttUser}::${deviceName}`
   return String(d.id ?? '').trim()
-}
-
-function normalizeBrokerUrl(raw: string): string {
-  const s = raw.trim()
-  if (/^wss?:\/\//i.test(s)) return s
-  return `wss://${s}:8884/mqtt`
 }
 
 function parseStatusAction(payloadText: string): string {
@@ -848,132 +843,253 @@ export default function DashboardPage() {
     const cleanups: (() => void)[] = []
     let mounted = true
 
-    // 3. 主連線：有設備憑證的伺服器
+    // 3. 主連線：有設備憑證的伺服器（EMQX 8084 / HiveMQ 8884 自動切換）
+    const markServerOffline = (no: number) => {
+      if (!mounted) return
+      setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
+    }
+
     for (const [no, group] of groups.entries()) {
-      const rawUrl = mqttMap[no]
-      if (!rawUrl) continue
-      const url = normalizeBrokerUrl(rawUrl)
+      const candidates = getBrokerCandidates(no, mqttMap)
+      if (!candidates || !candidates.length) continue
+      const autoSwap = candidates.length > 1 // 只有 hostname-only 才有多個候選
       const { ownerCred, topicsToIds } = group
       if (!ownerCred.mqtt_user || !ownerCred.mqtt_pass) continue
 
       let isActive = true
+      let candIdx = 0
+      let lastGoodIdx: number | null = null
+      let attemptsInRound = 0
+      let client: mqtt.MqttClient | null = null
       let offlineTimer: ReturnType<typeof setTimeout> | null = null
+      let watchdogTimer: ReturnType<typeof setTimeout> | null = null
+      let swapTimer: ReturnType<typeof setTimeout> | null = null
 
-      const client = mqtt.connect(url, {
-        username: ownerCred.mqtt_user,
-        password: ownerCred.mqtt_pass,
-        clientId: `maint_${no}_${Math.random().toString(36).slice(2, 8)}`,
-        reconnectPeriod: 5000,
-        keepalive: 60,           // 提高心跳穩定性
-        connectTimeout: 15000,  // 初次連線超時
-        clean: true,
-      })
+      const clearTimers = () => {
+        if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null }
+        if (swapTimer) { clearTimeout(swapTimer); swapTimer = null }
+      }
 
-      client.on('connect', () => {
-        if (!isActive || !mounted) return
-        // 取消待處理的 offline 計時器（重連成功）
-        if (offlineTimer) { clearTimeout(offlineTimer); offlineTimer = null }
-        setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: true, updatedAt: Date.now() } }))
-        const topics = Array.from(topicsToIds.keys())
-        if (topics.length) client.subscribe(topics, { qos: 0 })
-      })
-
-      client.on('message', (topic, payload) => {
-        if (!isActive || !mounted) return
-        const text = new TextDecoder().decode(payload).trim()
-        const action = parseStatusAction(text)
-        const a = String(action ?? '').trim().toLowerCase()
-        const online = a !== 'offline' && a !== 'disconnected'
-        const ids = topicsToIds.get(topic)
-        if (!ids) return
-        setDeviceOnlineByDeviceId((prev) => {
-          const next = { ...prev }
-          for (const id of ids) {
-            next[id] = { online, updatedAt: Date.now() }
-          }
-          return next
-        })
-      })
-
-      client.on('error', () => {
-        // auth / 憑證錯誤不強制標記 Offline
-      })
-
-      client.on('close', () => {
-        if (!isActive || !mounted) return
-        // 延遲 4 秒再標記 Offline，避免重連期間短暫閃爍
-        if (offlineTimer) clearTimeout(offlineTimer)
-        offlineTimer = setTimeout(() => {
-          if (!isActive || !mounted) return
-          setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
-        }, 4000)
-      })
-
-      // reconnect 事件不再立即標記 Offline（close 事件已有防抖處理）
-
-      cleanups.push(() => {
-        isActive = false
-        if (offlineTimer) { clearTimeout(offlineTimer); offlineTimer = null }
-        try { client.end(true) } catch { void 0 }
-      })
-    }
-
-    // 4. 探測連線：無設備的伺服器，用任一可用憑證探測 broker 是否回應
-    //    ● 連線成功（connect）→ 線上
-    //    ● Auth 被拒（error: not authorized）→ broker 有回應，視為線上
-    //    ● 其他錯誤 / close 未 settled → 視為離線
-    const fallbackCred = [...ownerByTopicKey.values()][0] ?? null
-    if (fallbackCred?.mqtt_user && fallbackCred?.mqtt_pass) {
-      for (const [noStr, rawUrl] of Object.entries(mqttMap)) {
-        const no = Number(noStr)
-        if (groups.has(no)) continue  // 已有主連線，略過
-
-        const url = normalizeBrokerUrl(rawUrl)
-        let isActive = true
-        let settled = false
-
-        const settle = (online: boolean) => {
-          if (settled || !mounted) return
-          settled = true
-          setServerOnlineByNo((prev) => ({ ...prev, [no]: { online, updatedAt: Date.now() } }))
+      // 單一候選失敗：換下一個候選；若整輪都失敗則標記離線，稍後再重試
+      const onAttemptFailed = () => {
+        if (!isActive || !autoSwap || swapTimer) return
+        attemptsInRound += 1
+        if (attemptsInRound >= candidates.length) {
+          markServerOffline(no)
+          swapTimer = setTimeout(() => {
+            swapTimer = null
+            if (!isActive) return
+            attemptsInRound = 0
+            candIdx = 0
+            connectOnce()
+          }, 15_000)
+          return
         }
+        swapTimer = setTimeout(() => {
+          swapTimer = null
+          if (!isActive) return
+          candIdx = (candIdx + 1) % candidates.length
+          connectOnce()
+        }, 300)
+      }
 
-        const probe = mqtt.connect(url, {
-          username: fallbackCred.mqtt_user!,
-          password: fallbackCred.mqtt_pass!,
-          clientId: `probe_${no}_${Math.random().toString(36).slice(2, 8)}`,
-          reconnectPeriod: 0,     // 探測連線不自動重連
-          connectTimeout: 15000,
-          keepalive: 60,
+      function connectOnce() {
+        if (!isActive) return
+        const url = candidates[candIdx % candidates.length]
+        clearTimers()
+        if (client) { try { client.end(true) } catch { void 0 } client = null }
+
+        client = mqtt.connect(url, {
+          username: ownerCred.mqtt_user!,
+          password: ownerCred.mqtt_pass!,
+          clientId: `maint_${no}_${Math.random().toString(36).slice(2, 8)}`,
+          reconnectPeriod: autoSwap ? 0 : 5000, // 自動切換模式改由 swap 控制重連
+          keepalive: 60,           // 提高心跳穩定性
+          connectTimeout: 15000,  // 初次連線超時
           clean: true,
         })
 
-        probe.on('connect', () => {
+        // 連線 watchdog（10 秒）：未在期限內連上 → 換埠或標記離線
+        watchdogTimer = setTimeout(() => {
           if (!isActive) return
-          settle(true)
-          try { probe.end(true) } catch { void 0 }
-        })
-
-        probe.on('error', (err) => {
-          if (!isActive) return
-          const msg = String((err as Error).message ?? '').toLowerCase()
-          // HiveMQ 拒絕 auth 會回 CONNACK rc=5，broker 本身是在線的
-          if (msg.includes('not authorized') || msg.includes('connection refused')) {
-            settle(true)
-          } else {
-            settle(false)
+          if (autoSwap && lastGoodIdx === null) {
+            onAttemptFailed()
+          } else if (offlineTimer === null) {
+            markServerOffline(no)
           }
-          try { probe.end(true) } catch { void 0 }
+        }, 10_000)
+
+        client.on('connect', () => {
+          if (!isActive || !mounted) return
+          clearTimers()
+          lastGoodIdx = candIdx % candidates.length
+          attemptsInRound = 0
+          const port = parsePortFromUrl(url)
+          if (port) writeLastPort(no, port)
+          // 取消待處理的 offline 計時器（重連成功）
+          if (offlineTimer) { clearTimeout(offlineTimer); offlineTimer = null }
+          setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: true, updatedAt: Date.now() } }))
+          const topics = Array.from(topicsToIds.keys())
+          if (topics.length) client?.subscribe(topics, { qos: 0 })
         })
 
-        probe.on('close', () => {
-          if (!isActive) return
-          settle(false)  // 若尚未 settle，表示無法連線
+        client.on('message', (topic, payload) => {
+          if (!isActive || !mounted) return
+          const text = new TextDecoder().decode(payload).trim()
+          const action = parseStatusAction(text)
+          const a = String(action ?? '').trim().toLowerCase()
+          const online = a !== 'offline' && a !== 'disconnected'
+          const ids = topicsToIds.get(topic)
+          if (!ids) return
+          setDeviceOnlineByDeviceId((prev) => {
+            const next = { ...prev }
+            for (const id of ids) {
+              next[id] = { online, updatedAt: Date.now() }
+            }
+            return next
+          })
         })
+
+        client.on('error', () => {
+          // auth / 憑證錯誤不強制標記 Offline；自動切換模式下換埠重試
+          if (autoSwap && lastGoodIdx === null) onAttemptFailed()
+        })
+
+        client.on('close', () => {
+          if (!isActive || !mounted) return
+          if (autoSwap) {
+            // 曾連上過 → 先重連同一候選；否則換埠探測
+            if (offlineTimer) clearTimeout(offlineTimer)
+            offlineTimer = setTimeout(() => {
+              if (!isActive) return
+              offlineTimer = null
+              if (lastGoodIdx !== null) {
+                candIdx = lastGoodIdx
+                attemptsInRound = 0
+                connectOnce()
+              } else {
+                onAttemptFailed()
+              }
+            }, 4_000)
+            return
+          }
+          // 非自動切換：延遲 4 秒再標記 Offline，避免重連期間短暫閃爍
+          if (offlineTimer) clearTimeout(offlineTimer)
+          offlineTimer = setTimeout(() => {
+            if (!isActive || !mounted) return
+            markServerOffline(no)
+          }, 4_000)
+        })
+
+        // reconnect 事件不再立即標記 Offline（close 事件已有防抖處理）
+      }
+
+      connectOnce()
+
+      cleanups.push(() => {
+        isActive = false
+        clearTimers()
+        if (offlineTimer) { clearTimeout(offlineTimer); offlineTimer = null }
+        if (client) { try { client.end(true) } catch { void 0 } client = null }
+      })
+    }
+
+    // 4. 探測連線：無設備的伺服器，用任一可用憑證探測 broker 是否回應（EMQX/HiveMQ 雙埠輪試）
+    //    ● 連線成功（connect）→ 線上
+    //    ● Auth 被拒（error: not authorized）→ broker 有回應，視為線上
+    //    ● 兩埠皆失敗 → 離線，15 秒後再試一輪
+    const fallbackCred = [...ownerByTopicKey.values()][0] ?? null
+    if (fallbackCred?.mqtt_user && fallbackCred?.mqtt_pass) {
+      for (const noStr of Object.keys(mqttMap)) {
+        const no = Number(noStr)
+        if (groups.has(no)) continue  // 已有主連線，略過
+        const candidates = getBrokerCandidates(no, mqttMap)
+        if (!candidates || !candidates.length) continue
+
+        let isActive = true
+        let settled = false
+        let candIdx = 0
+        let probe: mqtt.MqttClient | null = null
+        let watchdogTimer: ReturnType<typeof setTimeout> | null = null
+        let retryTimer: ReturnType<typeof setTimeout> | null = null
+
+        const setOnline = (online: boolean) => {
+          if (!mounted) return
+          setServerOnlineByNo((prev) => ({ ...prev, [no]: { online, updatedAt: Date.now() } }))
+        }
+
+        const probeFail = () => {
+          if (!isActive || !mounted) return
+          if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null }
+          if (probe) { try { probe.end(true) } catch { void 0 } probe = null }
+          if (settled) return
+          if (candIdx + 1 < candidates.length) {
+            candIdx += 1
+            retryTimer = setTimeout(() => { retryTimer = null; if (isActive) probeOnce() }, 300)
+          } else {
+            setOnline(false)   // 兩埠皆無回應 → 離線
+            retryTimer = setTimeout(() => {
+              retryTimer = null
+              if (!isActive) return
+              candIdx = 0
+              probeOnce()
+            }, 15_000)
+          }
+        }
+
+        function probeOnce() {
+          if (!isActive) return
+          const url = candidates[candIdx % candidates.length]
+          if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null }
+          if (probe) { try { probe.end(true) } catch { void 0 } probe = null }
+
+          probe = mqtt.connect(url, {
+            username: fallbackCred.mqtt_user!,
+            password: fallbackCred.mqtt_pass!,
+            clientId: `probe_${no}_${Math.random().toString(36).slice(2, 8)}`,
+            reconnectPeriod: 0,     // 探測連線不自動重連
+            connectTimeout: 10_000,
+            keepalive: 60,
+            clean: true,
+          })
+
+          watchdogTimer = setTimeout(() => { if (isActive) probeFail() }, 10_000)
+
+          probe.on('connect', () => {
+            if (!isActive) return
+            if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null }
+            const port = parsePortFromUrl(url)
+            if (port) writeLastPort(no, port)
+            settled = true
+            setOnline(true)
+            try { probe?.end(true) } catch { void 0 }
+          })
+
+          probe.on('error', (err) => {
+            if (!isActive) return
+            const msg = String((err as Error).message ?? '').toLowerCase()
+            // HiveMQ 拒絕 auth 會回 CONNACK rc=5，broker 本身是在線的
+            if (msg.includes('not authorized') || msg.includes('connection refused')) {
+              settled = true
+              setOnline(true)
+              try { probe?.end(true) } catch { void 0 }
+              return
+            }
+            probeFail()
+          })
+
+          probe.on('close', () => {
+            if (isActive) probeFail()
+          })
+        }
+
+        probeOnce()
 
         cleanups.push(() => {
           isActive = false
-          try { probe.end(true) } catch { void 0 }
+          if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null }
+          if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
+          if (probe) { try { probe.end(true) } catch { void 0 } probe = null }
         })
       }
     }
