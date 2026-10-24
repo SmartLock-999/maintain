@@ -798,21 +798,26 @@ export default function DashboardPage() {
     if (envMissing.length) return
     if (!deviceCreds.length || !Object.keys(mqttMap).length) return
 
-    // 1. 建立 owner row 查找表：key = `${mqtt_user}/${device_name}`
-    const ownerByTopicKey = new Map<string, DeviceCredentialRow>()
+    // 1. 建立憑證查找表：優先選擇非分享列，但若只有分享列且有密碼也接受
+    const credByTopicKey = new Map<string, DeviceCredentialRow>()
     for (const d of deviceCreds) {
       if (isIgnoredShareRow(d)) continue
-      if (String(d.share_from ?? '').trim()) continue
       const mqttUser = String(d.mqtt_user ?? '').trim()
       const deviceName = String(d.device_name ?? '').trim()
-      if (mqttUser && deviceName && d.mqtt_pass) {
-        ownerByTopicKey.set(`${mqttUser}/${deviceName}`, d)
+      const mqttPass = String(d.mqtt_pass ?? '').trim()
+      if (!mqttUser || !deviceName || !mqttPass) continue
+
+      const key = `${mqttUser}/${deviceName}`
+      const existing = credByTopicKey.get(key)
+      // 優先保留非分享列 (owner)
+      if (!existing || (String(existing.share_from ?? '').trim() && !String(d.share_from ?? '').trim())) {
+        credByTopicKey.set(key, d)
       }
     }
 
     // 2. 按 server_no 分組，建立 topic → device ids 映射
     type ServerGroup = {
-      ownerCred: DeviceCredentialRow
+      linkCred: DeviceCredentialRow
       topicsToIds: Map<string, string[]>
     }
     const groups = new Map<number, ServerGroup>()
@@ -826,11 +831,11 @@ export default function DashboardPage() {
       const no = d.server_no != null && d.server_no > 0 ? d.server_no : 1
       if (!mqttMap[no]) continue
 
-      const ownerRow = ownerByTopicKey.get(`${mqttUser}/${deviceName}`)
-      if (!ownerRow) continue
+      const linkCred = credByTopicKey.get(`${mqttUser}/${deviceName}`)
+      if (!linkCred) continue
 
       if (!groups.has(no)) {
-        groups.set(no, { ownerCred: ownerRow, topicsToIds: new Map() })
+        groups.set(no, { linkCred, topicsToIds: new Map() })
       }
       const group = groups.get(no)!
 
@@ -843,7 +848,7 @@ export default function DashboardPage() {
     const cleanups: (() => void)[] = []
     let mounted = true
 
-    // 3. 主連線：有設備憑證的伺服器（EMQX 8084 / HiveMQ 8884 自動切換）
+    // 3. 主連線：有設備憑證的伺服器
     const markServerOffline = (no: number) => {
       if (!mounted) return
       setServerOnlineByNo((prev) => ({ ...prev, [no]: { online: false, updatedAt: Date.now() } }))
@@ -852,9 +857,9 @@ export default function DashboardPage() {
     for (const [no, group] of groups.entries()) {
       const candidates = getBrokerCandidates(no, mqttMap)
       if (!candidates || !candidates.length) continue
-      const autoSwap = candidates.length > 1 // 只有 hostname-only 才有多個候選
-      const { ownerCred, topicsToIds } = group
-      if (!ownerCred.mqtt_user || !ownerCred.mqtt_pass) continue
+      const autoSwap = candidates.length > 1 
+      const { linkCred, topicsToIds } = group
+      if (!linkCred.mqtt_user || !linkCred.mqtt_pass) continue
 
       let isActive = true
       let candIdx = 0
@@ -870,7 +875,6 @@ export default function DashboardPage() {
         if (swapTimer) { clearTimeout(swapTimer); swapTimer = null }
       }
 
-      // 單一候選失敗：換下一個候選；若整輪都失敗則標記離線，稍後再重試
       const onAttemptFailed = () => {
         if (!isActive || !autoSwap || swapTimer) return
         attemptsInRound += 1
@@ -900,12 +904,12 @@ export default function DashboardPage() {
         if (client) { try { client.end(true) } catch { void 0 } client = null }
 
         client = mqtt.connect(url, {
-          username: ownerCred.mqtt_user!,
-          password: ownerCred.mqtt_pass!,
+          username: linkCred.mqtt_user!,
+          password: linkCred.mqtt_pass!,
           clientId: `maint_${no}_${Math.random().toString(36).slice(2, 8)}`,
-          reconnectPeriod: autoSwap ? 0 : 5000, // 自動切換模式改由 swap 控制重連
-          keepalive: 60,           // 提高心跳穩定性
-          connectTimeout: 15000,  // 初次連線超時
+          reconnectPeriod: autoSwap ? 0 : 5000,
+          keepalive: 60,
+          connectTimeout: 15000,
           clean: true,
         })
 
@@ -994,11 +998,8 @@ export default function DashboardPage() {
       })
     }
 
-    // 4. 探測連線：無設備的伺服器，用任一可用憑證探測 broker 是否回應（EMQX/HiveMQ 雙埠輪試）
-    //    ● 連線成功（connect）→ 線上
-    //    ● Auth 被拒（error: not authorized）→ broker 有回應，視為線上
-    //    ● 兩埠皆失敗 → 離線，15 秒後再試一輪
-    const fallbackCred = [...ownerByTopicKey.values()][0] ?? null
+    // 4. 探測連線：無設備的伺服器，用任一可用憑證探測 broker 是否回應
+    const fallbackCred = [...credByTopicKey.values()][0] ?? null
     if (fallbackCred?.mqtt_user && fallbackCred?.mqtt_pass) {
       for (const noStr of Object.keys(mqttMap)) {
         const no = Number(noStr)
