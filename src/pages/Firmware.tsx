@@ -38,6 +38,13 @@ type FirmwareVersionRow = {
   created_at: string
 }
 
+interface OtaLogEntry {
+  action: string
+  message?: string
+  percent?: number
+  status?: string
+}
+
 function displayDeviceName(d: DeviceCredentialRow): string {
   const custom = d.device_name_custom?.trim()
   if (custom) return custom
@@ -72,18 +79,16 @@ function parseAction(payloadText: string): string {
   return text
 }
 
-function parseOtaText(payloadText: string): string {
+function parseOtaText(payloadText: string): OtaLogEntry | null {
   try {
-    const parsed = JSON.parse(payloadText) as { action?: string; message?: string; percent?: number; status?: string }
+    const parsed = JSON.parse(payloadText) as OtaLogEntry
     if (parsed && typeof parsed === 'object') {
-      if (typeof parsed.message === 'string' && parsed.message) return parsed.message
-      if (typeof parsed.percent === 'number') return `更新中 ${parsed.percent}%`
-      if (typeof parsed.status === 'string') return parsed.status
+      return parsed
     }
   } catch {
     void 0
   }
-  return payloadText
+  return null
 }
 
 function formatSize(bytes: number | null | undefined): string {
@@ -126,7 +131,7 @@ export default function FirmwarePage() {
 
   const [serverOnline, setServerOnline] = useState<Record<string, boolean>>({})
   const [deviceOnline, setDeviceOnline] = useState<Record<string, boolean>>({})
-  const [otaLog, setOtaLog] = useState<Record<string, string>>({})
+  const [otaLog, setOtaLog] = useState<Record<string, OtaLogEntry>>({})
 
   const linksRef = useRef<Map<string, BrokerLink>>(new Map())
   const onlineRef = useRef<Record<string, boolean>>({})
@@ -360,7 +365,13 @@ export default function FirmwarePage() {
           const online = action !== '' && action !== 'offline' && action !== 'disconnected'
           setDeviceOnline((prev) => ({ ...prev, [dk]: online }))
           if (action === 'ota_progress' || action === 'ota_start' || action === 'ota_result' || action === 'ota_error') {
-            setOtaLog((prev) => ({ ...prev, [dk]: parseOtaText(payloadText) }))
+            const entry = parseOtaText(payloadText)
+            if (entry) {
+              setOtaLog((prev) => ({ ...prev, [dk]: entry }))
+            } else {
+              // 容錯：若解析失敗但 action 符合，建立一個基本的 entry
+              setOtaLog((prev) => ({ ...prev, [dk]: { action, message: payloadText } }))
+            }
           }
         })
       }
@@ -487,14 +498,15 @@ export default function FirmwarePage() {
     setSending(true)
     let okCount = 0
     let failCount = 0
-    const logPatch: Record<string, string> = {}
+    const logPatch: Record<string, OtaLogEntry> = {}
 
     for (const d of targets) {
       const no = Number(d.server_no)
       const mqttUser = String(d.mqtt_user ?? '').trim()
+      const dk = deviceKeyOf(d)
       if (!mqttUser || !String(d.mqtt_pass ?? '').trim()) {
         failCount += 1
-        logPatch[deviceKeyOf(d)] = '缺少 MQTT 憑證，無法送出'
+        logPatch[dk] = { action: 'ui_error', message: '缺少 MQTT 憑證，無法送出' }
         continue
       }
       const link = linksRef.current.get(`${no}::${mqttUser}`)
@@ -508,14 +520,14 @@ export default function FirmwarePage() {
         const sent = link.publish(commandTopicOf(d), payload, 1)
         if (sent) {
           okCount += 1
-          logPatch[deviceKeyOf(d)] = '已送出更新指令'
+          logPatch[dk] = { action: 'ui_info', message: '已送出更新指令' }
         } else {
           failCount += 1
-          logPatch[deviceKeyOf(d)] = '送出失敗（連線中斷）'
+          logPatch[dk] = { action: 'ui_error', message: '送出失敗（連線中斷）' }
         }
       } else {
         failCount += 1
-        logPatch[deviceKeyOf(d)] = '伺服器未連線，無法送出'
+        logPatch[dk] = { action: 'ui_error', message: '伺服器未連線，無法送出' }
       }
     }
 
@@ -757,7 +769,44 @@ export default function FirmwarePage() {
                             label={online === true ? '在線' : online === false ? '離線' : '未知'}
                           />
                         </td>
-                        <td className="px-3 py-2 text-xs text-slate-300">{otaLog[dk] ?? '—'}</td>
+                        <td className="px-3 py-2 text-xs text-slate-300">
+                          {(() => {
+                            const log = otaLog[dk]
+                            if (!log) return '—'
+
+                            if (log.action === 'ota_result' && log.status === 'success') {
+                              return <span className="font-medium text-emerald-400">更新完成</span>
+                            }
+
+                            if (log.action === 'ota_error' || log.action === 'ui_error') {
+                              return <span className="text-rose-400">{log.message || log.status || '更新出錯'}</span>
+                            }
+
+                            if (log.action === 'ui_info') {
+                              return <span className="text-blue-400">{log.message}</span>
+                            }
+
+                            const hasPercent = typeof log.percent === 'number'
+                            const displayMsg = log.message || log.status || (log.action === 'ota_start' ? '開始更新' : '')
+
+                            return (
+                              <div className="flex flex-col gap-1">
+                                {displayMsg && <div className="truncate">{displayMsg}</div>}
+                                {hasPercent && (
+                                  <div className="flex items-center gap-2">
+                                    <div className="h-1.5 w-24 overflow-hidden rounded-full bg-slate-700">
+                                      <div
+                                        className="h-full bg-blue-500 transition-all duration-300"
+                                        style={{ width: `${log.percent}%` }}
+                                      />
+                                    </div>
+                                    <span className="text-[10px] text-slate-400">{log.percent}%</span>
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })()}
+                        </td>
                       </tr>
                     )
                   })}
