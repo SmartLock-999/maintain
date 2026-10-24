@@ -144,6 +144,7 @@ export default function DashboardPage() {
   const [deviceOnlineByDeviceId, setDeviceOnlineByDeviceId] = useState<Record<string, { online: boolean; updatedAt: number }>>({})
   // 長連線用：key = server_no，value = { online, updatedAt }
   const [serverOnlineByNo, setServerOnlineByNo] = useState<Record<number, { online: boolean; updatedAt: number }>>({})
+  const [selectedMqttServerNo, setSelectedMqttServerNo] = useState<number | null>(null)
 
   const adminCount = useMemo(() => registered.filter((r) => getPermissions(r) === 'admin').length, [registered])
 
@@ -1369,26 +1370,53 @@ export default function DashboardPage() {
             <CardTitle>MQTT 伺服器（mqtt_list）</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="space-y-2">
+            <div className="space-y-4">
               {mqttListVisible.length === 0 ? (
                 <div className="text-sm text-slate-300">{loading ? '讀取中…' : '目前沒有資料'}</div>
               ) : (
-                mqttListVisible.map((s) => {
-                  const status = mqttServerStatus[s.server_no] ?? 'Unknown'
-                  const tone = status === 'Online' ? 'success' : status === 'Offline' ? 'danger' : 'muted'
-                  const label = status === 'Online' ? '線上' : status === 'Offline' ? '離線' : '未知'
-                  return (
-                  <div key={s.server_no} className="flex items-start justify-between gap-3 rounded-lg border border-slate-800/60 bg-white/5 px-3 py-2">
-                    <div>
-                      <div className="text-sm font-medium text-slate-100">Server #{s.server_no}</div>
-                      <div className="text-xs text-slate-400 break-all">{s.url}</div>
+                <>
+                  <Select
+                    value={selectedMqttServerNo ?? ''}
+                    onChange={(e) => setSelectedMqttServerNo(e.target.value ? Number(e.target.value) : null)}
+                    className="bg-slate-900/60"
+                  >
+                    <option value="" className="bg-slate-900 text-slate-400">
+                      — 選擇伺服器 —
+                    </option>
+                    {mqttListVisible.map((s) => {
+                      const status = mqttServerStatus[s.server_no] ?? 'Unknown'
+                      const label = status === 'Online' ? '● 線上' : status === 'Offline' ? '○ 離線' : '？ 未知'
+                      return (
+                        <option key={s.server_no} value={s.server_no} className="bg-slate-900 text-slate-200">
+                          Server #{s.server_no} ({label})
+                        </option>
+                      )
+                    })}
+                  </Select>
+
+                  {selectedMqttServerNo !== null && (
+                    <div className="rounded-lg border border-slate-800/60 bg-white/5 p-3 animate-in fade-in slide-in-from-top-1 duration-200">
+                      {mqttListVisible
+                        .filter((s) => s.server_no === selectedMqttServerNo)
+                        .map((s) => {
+                          const status = mqttServerStatus[s.server_no] ?? 'Unknown'
+                          const tone = status === 'Online' ? 'success' : status === 'Offline' ? 'danger' : 'muted'
+                          const label = status === 'Online' ? '線上' : status === 'Offline' ? '離線' : '未知'
+                          return (
+                            <div key={s.server_no} className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="text-sm font-medium text-slate-100">Server #{s.server_no}</div>
+                                <div className="mt-1 text-xs text-slate-400 break-all font-mono">{s.url}</div>
+                              </div>
+                              <div className="flex-shrink-0 pt-0.5">
+                                <StatusBadge tone={tone} label={label} />
+                              </div>
+                            </div>
+                          )
+                        })}
                     </div>
-                    <div className="pt-0.5">
-                      <StatusBadge tone={tone} label={label} />
-                    </div>
-                  </div>
-                  )
-                })
+                  )}
+                </>
               )}
             </div>
           </CardContent>
