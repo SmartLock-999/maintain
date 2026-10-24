@@ -3,11 +3,11 @@ import { Cpu, HardDriveDownload, LayoutDashboard } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 
-export function Sidebar() {
+export function Sidebar({ className, onItemClick }: { className?: string; onItemClick?: () => void }) {
   const user = useAuthStore((s) => s.user)
 
   return (
-    <aside className="hidden border-r border-slate-800/60 bg-[#0F1730]/60 px-4 py-6 lg:block">
+    <aside className={cn("hidden border-r border-slate-800/60 bg-[#0F1730]/60 px-4 py-6 lg:block", className)}>
       <div className="flex items-center gap-2">
         <div className="rounded-lg border border-cyan-400/20 bg-cyan-400/10 p-2 text-cyan-200">
           <Cpu className="h-5 w-5" />
@@ -27,6 +27,7 @@ export function Sidebar() {
               isActive ? 'bg-white/5 text-cyan-100' : 'text-slate-300',
             )
           }
+          onClick={onItemClick}
           end
         >
           <LayoutDashboard className="h-4 w-4" />
@@ -41,6 +42,7 @@ export function Sidebar() {
               isActive ? 'bg-white/5 text-cyan-100' : 'text-slate-300',
             )
           }
+          onClick={onItemClick}
         >
           <HardDriveDownload className="h-4 w-4" />
           韌體更新

@@ -170,28 +170,38 @@ export default function FirmwarePage() {
     if (selectedServerNo == null && serverNumbers.length) setSelectedServerNo(serverNumbers[0])
   }, [selectedServerNo, serverNumbers])
 
-  // 擁有者設備（排除分享列）
-  const ownerDevices = useMemo(
-    () =>
-      deviceCreds.filter((d) => {
-        if (String(d.share_from ?? '').trim()) return false
-        const u = String(d.mqtt_user ?? '').trim()
-        const n = String(d.device_name ?? '').trim()
-        return Boolean(u && n && d.mqtt_pass && d.server_no)
-      }),
-    [deviceCreds],
-  )
+  // 伺服器上的所有設備（不分擁有者，管理員可一次更新全部）
+  // 以 mqtt_user + device_name 去重（同一實體設備可能同時有擁有者列與分享列）
+  const allDevices = useMemo(() => {
+    const byKey = new Map<string, DeviceCredentialRow>()
+    for (const d of deviceCreds) {
+      const u = String(d.mqtt_user ?? '').trim()
+      const n = String(d.device_name ?? '').trim()
+      // 分享列若無 mqtt_user/device_name 無法識別，略過（其擁有者列仍會出現在清單）
+      if (String(d.share_from ?? '').trim() && !(u && n)) continue
+      const key = u && n ? `${u}::${n}` : `id:${d.id}`
+      const prev = byKey.get(key)
+      if (!prev) {
+        byKey.set(key, d)
+        continue
+      }
+      // 偏好含 mqtt_pass 的列（才能對該設備發送指令）
+      if (!String(prev.mqtt_pass ?? '').trim() && String(d.mqtt_pass ?? '').trim()) byKey.set(key, d)
+    }
+    return Array.from(byKey.values())
+  }, [deviceCreds])
 
   const devicesByServer = useMemo(() => {
     const m = new Map<number, DeviceCredentialRow[]>()
-    for (const d of ownerDevices) {
+    for (const d of allDevices) {
+      if (d.server_no == null) continue
       const no = Number(d.server_no)
       if (!m.has(no)) m.set(no, [])
       m.get(no)!.push(d)
     }
     for (const list of m.values()) list.sort((a, b) => displayDeviceName(a).localeCompare(displayDeviceName(b)))
     return m
-  }, [ownerDevices])
+  }, [allDevices])
 
   const currentDevices = useMemo(
     () => (selectedServerNo == null ? [] : devicesByServer.get(selectedServerNo) ?? []),
@@ -217,7 +227,7 @@ export default function FirmwarePage() {
 
   // ── 長連線：每個 (server_no, mqtt_user) 一條，訂閱設備 status ──
   const brokerKey = useMemo(() => {
-    const devPart = ownerDevices
+    const devPart = allDevices
       .map((d) => `${d.id}:${d.mqtt_user}:${d.server_no}`)
       .sort()
       .join('|')
@@ -226,17 +236,18 @@ export default function FirmwarePage() {
       .map(([k, v]) => `${k}=${v}`)
       .join('|')
     return `${devPart}||${mapPart}`
-  }, [ownerDevices, mqttMap])
+  }, [allDevices, mqttMap])
 
   useEffect(() => {
-    if (!ownerDevices.length || !Object.keys(mqttMap).length) return
+    if (!allDevices.length || !Object.keys(mqttMap).length) return
 
     type Group = { no: number; cred: DeviceCredentialRow; devices: DeviceCredentialRow[] }
     const groups = new Map<string, Group>()
-    for (const d of ownerDevices) {
+    for (const d of allDevices) {
       const no = Number(d.server_no)
       if (!mqttMap[no]) continue
       const mqttUser = String(d.mqtt_user ?? '').trim()
+      if (!mqttUser || !String(d.mqtt_pass ?? '').trim()) continue
       const key = `${no}::${mqttUser}`
       if (!groups.has(key)) groups.set(key, { no, cred: d, devices: [] })
       groups.get(key)!.devices.push(d)
@@ -367,8 +378,13 @@ export default function FirmwarePage() {
 
     for (const d of targets) {
       const no = Number(d.server_no)
-      const key = `${no}::${String(d.mqtt_user ?? '').trim()}`
-      const link = linksRef.current.get(key)
+      const mqttUser = String(d.mqtt_user ?? '').trim()
+      if (!mqttUser || !String(d.mqtt_pass ?? '').trim()) {
+        failCount += 1
+        logPatch[deviceKeyOf(d)] = '缺少 MQTT 憑證，無法送出'
+        continue
+      }
+      const link = linksRef.current.get(`${no}::${mqttUser}`)
       const payload = JSON.stringify({
         action: 'ota',
         url,
@@ -574,13 +590,14 @@ export default function FirmwarePage() {
             <div className="text-sm text-slate-300">此伺服器沒有可更新的設備</div>
           ) : (
             <div className="overflow-auto">
-              <table className="w-full min-w-[720px] text-sm">
+              <table className="w-full min-w-[860px] text-sm">
                 <thead className="text-left text-xs text-slate-400">
                   <tr className="border-b border-slate-800/60">
                     <th className="w-10 px-3 py-2">
                       <input type="checkbox" checked={allSelected} onChange={toggleAll} />
                     </th>
                     <th className="px-3 py-2 font-medium">設備名稱</th>
+                    <th className="px-3 py-2 font-medium">擁有者</th>
                     <th className="px-3 py-2 font-medium">mqtt_user</th>
                     <th className="px-3 py-2 font-medium">device_name</th>
                     <th className="px-3 py-2 font-medium">狀態</th>
@@ -591,6 +608,7 @@ export default function FirmwarePage() {
                   {currentDevices.map((d) => {
                     const dk = deviceKeyOf(d)
                     const online = deviceOnline[dk]
+                    const hasCred = Boolean(String(d.mqtt_user ?? '').trim() && String(d.mqtt_pass ?? '').trim())
                     return (
                       <tr key={d.id} className="border-b border-slate-800/40">
                         <td className="px-3 py-2">
@@ -600,7 +618,15 @@ export default function FirmwarePage() {
                             onChange={() => toggleOne(d.id)}
                           />
                         </td>
-                        <td className="px-3 py-2 text-slate-100">{displayDeviceName(d)}</td>
+                        <td className="px-3 py-2 text-slate-100">
+                          {displayDeviceName(d)}
+                          {hasCred ? null : (
+                            <span className="ml-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[11px] text-amber-200">
+                              無憑證
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-xs text-slate-300">{d.user_id ? String(d.user_id) : '—'}</td>
                         <td className="px-3 py-2 font-mono text-xs text-slate-300">{d.mqtt_user ?? '—'}</td>
                         <td className="px-3 py-2 font-mono text-xs text-slate-300">{d.device_name ?? '—'}</td>
                         <td className="px-3 py-2">

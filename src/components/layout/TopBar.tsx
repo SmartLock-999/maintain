@@ -1,14 +1,24 @@
-import { LogOut, RefreshCw } from 'lucide-react'
+import { LogOut, Menu, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { useAuthStore } from '@/stores/authStore'
 
-export function TopBar() {
+export function TopBar({ onMenuClick }: { onMenuClick?: () => void }) {
   const signOut = useAuthStore((s) => s.signOut)
 
   return (
     <header className="sticky top-0 z-10 border-b border-slate-800/60 bg-[#0B1020]/80 backdrop-blur">
       <div className="mx-auto flex max-w-[1400px] items-center justify-between px-4 py-3 lg:px-6">
-        <div className="text-sm font-semibold tracking-wide">設備管理</div>
+        <div className="flex items-center gap-3">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="px-2 lg:hidden"
+            onClick={onMenuClick}
+          >
+            <Menu className="h-5 w-5" />
+          </Button>
+          <div className="text-sm font-semibold tracking-wide">設備管理</div>
+        </div>
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"
