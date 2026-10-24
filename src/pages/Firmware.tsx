@@ -537,7 +537,7 @@ export default function FirmwarePage() {
         const sent = link.publish(commandTopicOf(d), payload, 1)
         if (sent) {
           okCount += 1
-          logPatch[dk] = { action: 'ui_info', message: '已送出更新指令' }
+          logPatch[dk] = { action: 'ui_info', message: '更新中' }
         } else {
           failCount += 1
           logPatch[dk] = { action: 'ui_error', message: '送出失敗（連線中斷）' }
@@ -812,7 +812,9 @@ export default function FirmwarePage() {
                             }
 
                             const hasPercent = typeof log.percent === 'number'
-                            const displayMsg = log.message || log.status || (log.action === 'ota_start' ? '開始更新' : '')
+                            // 下載／燒錄期間一律只顯示「更新中」，成功後才顯示「更新完成」
+                            const inProgress = log.action === 'ota_start' || log.action === 'ota_progress'
+                            const displayMsg = inProgress ? '更新中' : (log.message || log.status || '')
 
                             return (
                               <div className="flex flex-col gap-1">
