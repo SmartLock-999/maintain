@@ -80,13 +80,33 @@ function parseAction(payloadText: string): string {
 }
 
 function parseOtaText(payloadText: string): OtaLogEntry | null {
+  const text = payloadText.trim()
+  if (!text) return null
+
   try {
-    const parsed = JSON.parse(payloadText) as OtaLogEntry
+    const parsed = JSON.parse(text) as OtaLogEntry
     if (parsed && typeof parsed === 'object') {
-      return parsed
+      // 只要有 percent 欄位，或者 action 以 ota_ 開頭，就判定為 OTA 訊息
+      const hasPercent = typeof parsed.percent === 'number'
+      const hasOtaAction = typeof parsed.action === 'string' && parsed.action.startsWith('ota')
+      const hasOtaKeywords =
+        hasPercent ||
+        hasOtaAction ||
+        (typeof parsed.message === 'string' && /ota|韌體|更新/i.test(parsed.message)) ||
+        (typeof parsed.status === 'string' && /ota|韌體|更新/i.test(parsed.status))
+
+      if (hasOtaKeywords) {
+        return {
+          ...parsed,
+          action: parsed.action || (hasPercent ? 'ota_progress' : 'ota_info'),
+        }
+      }
     }
   } catch {
-    void 0
+    // 非 JSON 格式，但包含 OTA 關鍵字
+    if (/ota|韌體|更新/i.test(text)) {
+      return { action: 'ota_info', message: text }
+    }
   }
   return null
 }
@@ -364,14 +384,11 @@ export default function FirmwarePage() {
           const action = parseAction(payloadText)
           const online = action !== '' && action !== 'offline' && action !== 'disconnected'
           setDeviceOnline((prev) => ({ ...prev, [dk]: online }))
-          if (action === 'ota_progress' || action === 'ota_start' || action === 'ota_result' || action === 'ota_error') {
-            const entry = parseOtaText(payloadText)
-            if (entry) {
-              setOtaLog((prev) => ({ ...prev, [dk]: entry }))
-            } else {
-              // 容錯：若解析失敗但 action 符合，建立一個基本的 entry
-              setOtaLog((prev) => ({ ...prev, [dk]: { action, message: payloadText } }))
-            }
+
+          // 優先判斷是否為 OTA 相關訊息
+          const otaEntry = parseOtaText(payloadText)
+          if (otaEntry) {
+            setOtaLog((prev) => ({ ...prev, [dk]: otaEntry }))
           }
         })
       }
@@ -774,11 +791,15 @@ export default function FirmwarePage() {
                             const log = otaLog[dk]
                             if (!log) return '—'
 
-                            if (log.action === 'ota_result' && log.status === 'success') {
+                            const isSuccess =
+                              (log.action === 'ota_result' && (log.status === 'success' || log.message === 'success' || /ok|成功|完成/i.test(log.message || ''))) ||
+                              (typeof log.message === 'string' && /更新完成|更新成功/i.test(log.message))
+
+                            if (isSuccess) {
                               return <span className="font-medium text-emerald-400">更新完成</span>
                             }
 
-                            if (log.action === 'ota_error' || log.action === 'ui_error') {
+                            if (log.action === 'ota_error' || log.action === 'ui_error' || (typeof log.message === 'string' && /error|失敗|出錯/i.test(log.message))) {
                               return <span className="text-rose-400">{log.message || log.status || '更新出錯'}</span>
                             }
 
