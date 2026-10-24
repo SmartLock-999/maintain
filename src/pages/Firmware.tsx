@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { CloudUpload, RefreshCw, Send } from 'lucide-react'
+import { CloudUpload, RefreshCw, Send, Trash2 } from 'lucide-react'
+import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
 import { Button } from '@/components/ui/Button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card'
@@ -90,6 +91,12 @@ function formatSize(bytes: number | null | undefined): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}
+
+function normalizeBrokerUrl(raw: string): string {
+  const s = raw.trim()
+  if (/^wss?:\/\//i.test(s)) return s
+  return `wss://${s}:8884/mqtt`
 }
 
 export default function FirmwarePage() {
@@ -225,6 +232,84 @@ export default function FirmwarePage() {
     setSendMsg(null)
   }, [selectedServerNo])
 
+  // ── 伺服器連線檢查（與 Dashboard 同步邏輯） ──
+  useEffect(() => {
+    if (envMissing.length || !mqttList.length) return
+
+    const connectTimeoutMs = 6000
+    const intervalMs = 60_000
+    let cancelled = false
+
+    const checkServer = (serverNo: number, rawUrl: string) =>
+      new Promise<void>((resolve) => {
+        const url = normalizeBrokerUrl(rawUrl)
+        // 嘗試用該伺服器上的任一設備憑證連線
+        const creds = deviceCreds.find(
+          (d) =>
+            Number(d.server_no) === serverNo &&
+            String(d.mqtt_user ?? '').trim() &&
+            String(d.mqtt_pass ?? '').trim(),
+        )
+
+        const client = mqtt.connect(url, {
+          username: creds?.mqtt_user ?? undefined,
+          password: creds?.mqtt_pass ?? undefined,
+          clientId: `maint_fw_srv_${Math.random().toString(36).slice(2, 9)}`,
+          reconnectPeriod: 0,
+          keepalive: 10,
+          clean: true,
+          connectTimeout: connectTimeoutMs,
+        })
+
+        let settled = false
+        const done = (online: boolean) => {
+          if (settled) return
+          settled = true
+          try {
+            client.end(true)
+          } catch {
+            void 0
+          }
+          if (!cancelled) {
+            onlineRef.current[`${serverNo}::status`] = online
+            setServerOnline({ ...onlineRef.current })
+          }
+          resolve()
+        }
+
+        const t = window.setTimeout(() => done(false), connectTimeoutMs)
+        client.on('connect', () => {
+          window.clearTimeout(t)
+          done(true)
+        })
+        client.on('error', (e) => {
+          window.clearTimeout(t)
+          const msg = String((e as Error | undefined)?.message ?? '').toLowerCase()
+          const authError =
+            msg.includes('not authorized') ||
+            msg.includes('bad username') ||
+            msg.includes('identifier rejected') ||
+            msg.includes('connection refused')
+          done(authError ? true : false)
+        })
+        client.on('close', () => {
+          window.clearTimeout(t)
+          if (!settled) done(false)
+        })
+      })
+
+    const run = async () => {
+      await Promise.all(mqttList.map((s) => checkServer(s.server_no, s.url)))
+    }
+
+    void run()
+    const t = window.setInterval(() => void run(), intervalMs)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [deviceCreds, envMissing.length, mqttList])
+
   // ── 長連線：每個 (server_no, mqtt_user) 一條，訂閱設備 status ──
   const brokerKey = useMemo(() => {
     const devPart = allDevices
@@ -347,6 +432,28 @@ export default function FirmwarePage() {
     }
   }, [selectedServerNo, uploadVersion, uploadFile, uploadNotes, user?.email, user?.id])
 
+  // ── 刪除韌體 ──
+  const onDeleteVersion = useCallback(
+    async (v: FirmwareVersionRow) => {
+      if (!window.confirm(`確定要刪除版本 ${v.version} (${v.file_name}) 嗎？`)) return
+      try {
+        // 1. 刪除 Storage 檔案
+        const { error: storageErr } = await supabase.storage.from('firmware').remove([v.storage_path])
+        if (storageErr) throw storageErr
+
+        // 2. 刪除資料庫紀錄
+        const { error: dbErr } = await supabase.from('firmware_versions').delete().eq('id', v.id)
+        if (dbErr) throw dbErr
+
+        if (selectedVersionId === v.id) setSelectedVersionId(null)
+        setRefreshNonce((n) => n + 1)
+      } catch (e) {
+        alert(e instanceof Error ? e.message : '刪除失敗')
+      }
+    },
+    [selectedVersionId],
+  )
+
   // ── 發送遠端更新 ──
   const onSendOta = useCallback(async () => {
     setSendMsg(null)
@@ -456,9 +563,11 @@ export default function FirmwarePage() {
           >
             <option value="">請選擇</option>
             {serverNumbers.map((no) => {
-              const online = Object.entries(serverOnline)
-                .filter(([k]) => k.startsWith(`${no}::`))
-                .some(([, v]) => v)
+              const online =
+                Object.entries(serverOnline)
+                  .filter(([k]) => k.startsWith(`${no}::`))
+                  .some(([, v]) => v) ||
+                allDevices.some((d) => Number(d.server_no) === no && deviceOnline[deviceKeyOf(d)])
               return (
                 <option key={no} value={no}>
                   Server #{no}（{online ? '線上' : '離線'}）
@@ -468,24 +577,19 @@ export default function FirmwarePage() {
           </Select>
         </div>
         <div className="flex items-center gap-2 pb-1">
-          {selectedServerNo == null ? null : (
-            <StatusBadge
-              tone={
-                Object.entries(serverOnline)
-                  .filter(([k]) => k.startsWith(`${selectedServerNo}::`))
-                  .some(([, v]) => v)
-                  ? 'success'
-                  : 'danger'
-              }
-              label={
-                Object.entries(serverOnline)
-                  .filter(([k]) => k.startsWith(`${selectedServerNo}::`))
-                  .some(([, v]) => v)
-                  ? 'MQTT 已連線'
-                  : 'MQTT 未連線'
-              }
-            />
-          )}
+          {selectedServerNo == null ? null : (() => {
+            const isOnline =
+              Object.entries(serverOnline)
+                .filter(([k]) => k.startsWith(`${selectedServerNo}::`))
+                .some(([, v]) => v) ||
+              currentDevices.some((d) => deviceOnline[deviceKeyOf(d)])
+            return (
+              <StatusBadge
+                tone={isOnline ? 'success' : 'danger'}
+                label={isOnline ? 'MQTT 已連線' : 'MQTT 未連線'}
+              />
+            )
+          })()}
           <span className="text-xs text-slate-400">設備 {currentDevices.length} 台</span>
         </div>
       </div>
@@ -550,7 +654,7 @@ export default function FirmwarePage() {
                   <button
                     key={v.id}
                     className={
-                      'w-full rounded-lg border px-3 py-2 text-left transition ' +
+                      'group relative w-full rounded-lg border px-3 py-2 text-left transition ' +
                       (selectedVersionId === v.id
                         ? 'border-cyan-400/50 bg-cyan-400/10'
                         : 'border-slate-800/60 bg-white/5 hover:bg-white/10')
@@ -559,7 +663,19 @@ export default function FirmwarePage() {
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-mono text-sm text-slate-100">{v.version}</span>
-                      <span className="text-xs text-slate-400">{formatSize(v.file_size)}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-slate-400">{formatSize(v.file_size)}</span>
+                        <button
+                          className="hidden rounded p-1 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400 group-hover:block"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void onDeleteVersion(v)
+                          }}
+                          title="刪除版本"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
                     <div className="mt-1 truncate text-xs text-slate-400">{v.file_name}</div>
                     <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
