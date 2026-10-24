@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { CloudUpload, RefreshCw, Send, Trash2 } from 'lucide-react'
 import mqtt from 'mqtt'
 import { AppShell } from '@/components/layout/AppShell'
@@ -24,6 +24,7 @@ type DeviceCredentialRow = {
   mqtt_pass?: string | null
   server_no?: number | null
   share_from?: string | null
+  firmware_version?: string | null
 }
 
 type FirmwareVersionRow = {
@@ -152,6 +153,7 @@ export default function FirmwarePage() {
   const [serverOnline, setServerOnline] = useState<Record<string, boolean>>({})
   const [deviceOnline, setDeviceOnline] = useState<Record<string, boolean>>({})
   const [otaLog, setOtaLog] = useState<Record<string, OtaLogEntry>>({})
+  const [otaSentVersion, setOtaSentVersion] = useState<Record<string, string>>({})
 
   const linksRef = useRef<Map<string, BrokerLink>>(new Map())
   const onlineRef = useRef<Record<string, boolean>>({})
@@ -165,7 +167,7 @@ export default function FirmwarePage() {
       supabase.from('mqtt_list').select('server_no, url').order('server_no', { ascending: true }),
       supabase
         .from('device_credentials')
-        .select('id, user_id, device_name, device_name_initial, device_name_custom, mqtt_user, mqtt_pass, server_no, share_from'),
+        .select('id, user_id, device_name, device_name_initial, device_name_custom, mqtt_user, mqtt_pass, server_no, share_from, firmware_version'),
       supabase
         .from('firmware_versions')
         .select('id, server_no, version, file_name, storage_path, file_size, notes, uploaded_by, created_at')
@@ -179,8 +181,18 @@ export default function FirmwarePage() {
       return
     }
     setMqttList((mqttRes.data ?? []) as MqttListRow[])
-    setDeviceCreds((devRes.data ?? []) as DeviceCredentialRow[])
+    const devRows = (devRes.data ?? []) as DeviceCredentialRow[]
+    setDeviceCreds(devRows)
     setVersions((verRes.data ?? []) as FirmwareVersionRow[])
+
+    // 由資料庫還原每台設備最後派送的韌體版本（永久記錄）
+    const versionMap: Record<string, string> = {}
+    for (const d of devRows) {
+      const v = String(d.firmware_version ?? '').trim()
+      if (v) versionMap[deviceKeyOf(d)] = v
+    }
+    setOtaSentVersion(versionMap)
+
     setLoading(false)
   }, [envMissing.length])
 
@@ -513,6 +525,8 @@ export default function FirmwarePage() {
     let okCount = 0
     let failCount = 0
     const logPatch: Record<string, OtaLogEntry> = {}
+    const versionPatch: Record<string, string> = {}
+    const sentDeviceIds: string[] = []
 
     for (const d of targets) {
       const no = Number(d.server_no)
@@ -535,6 +549,8 @@ export default function FirmwarePage() {
         if (sent) {
           okCount += 1
           logPatch[dk] = { action: 'ui_info', message: '更新中' }
+          versionPatch[dk] = selectedVersion.version
+          sentDeviceIds.push(d.id)
         } else {
           failCount += 1
           logPatch[dk] = { action: 'ui_error', message: '送出失敗（連線中斷）' }
@@ -545,7 +561,26 @@ export default function FirmwarePage() {
       }
     }
 
+    // 永久記錄：將派送成功的設備最後版本寫回資料庫
+    if (sentDeviceIds.length) {
+      const { error: upErr } = await supabase
+        .from('device_credentials')
+        .update({ firmware_version: selectedVersion.version })
+        .in('id', sentDeviceIds)
+      if (upErr) {
+        setSendMsg(`已送出 ${okCount} 台，但版本記錄寫入失敗：${upErr.message}`)
+        setOtaLog((prev) => ({ ...prev, ...logPatch }))
+        setOtaSentVersion((prev) => ({ ...prev, ...versionPatch }))
+        setSending(false)
+        return
+      }
+      setDeviceCreds((prev) =>
+        prev.map((d) => (sentDeviceIds.includes(d.id) ? { ...d, firmware_version: selectedVersion.version } : d)),
+      )
+    }
+
     setOtaLog((prev) => ({ ...prev, ...logPatch }))
+    setOtaSentVersion((prev) => ({ ...prev, ...versionPatch }))
     setSending(false)
     setSendMsg(`已送出 ${okCount} 台${failCount ? `，失敗 ${failCount} 台` : ''}`)
   }, [selectedVersion, selectedDeviceIds, currentDevices])
@@ -749,7 +784,7 @@ export default function FirmwarePage() {
                     <th className="px-3 py-2 font-medium">mqtt_user</th>
                     <th className="px-3 py-2 font-medium">device_name</th>
                     <th className="px-3 py-2 font-medium">狀態</th>
-                    <th className="px-3 py-2 font-medium">更新狀態</th>
+                    <th className="px-3 py-2 font-medium">更新狀態 / 版本</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -786,47 +821,54 @@ export default function FirmwarePage() {
                         <td className="px-3 py-2 text-xs text-slate-300">
                           {(() => {
                             const log = otaLog[dk]
-                            if (!log) return '—'
+                            const sentVersion = otaSentVersion[dk]
 
-                            const isSuccess =
-                              (log.action === 'ota_result' && (log.status === 'success' || log.message === 'success' || /ok|成功|完成/i.test(log.message || ''))) ||
-                              (typeof log.message === 'string' && /更新完成|更新成功/i.test(log.message))
+                            let statusNode: ReactNode = <span className="text-slate-500">—</span>
+                            if (log) {
+                              const isSuccess =
+                                (log.action === 'ota_result' && (log.status === 'success' || log.message === 'success' || /ok|成功|完成/i.test(log.message || ''))) ||
+                                (typeof log.message === 'string' && /更新完成|更新成功/i.test(log.message))
 
-                            if (isSuccess) {
-                              return <span className="font-medium text-emerald-400">更新完成</span>
+                              if (isSuccess) {
+                                statusNode = <span className="font-medium text-emerald-400">更新完成</span>
+                              } else if (log.action === 'ota_error' || log.action === 'ui_error' || (typeof log.message === 'string' && /error|失敗|出錯/i.test(log.message))) {
+                                statusNode = <span className="text-rose-400">{log.message || log.status || '更新出錯'}</span>
+                              } else if (log.action === 'ui_info') {
+                                statusNode = <span className="text-blue-400">{log.message}</span>
+                              } else if (log.action === 'ota_retry') {
+                                statusNode = <span className="text-amber-400">{log.message || '準備重試…'}</span>
+                              } else {
+                                const hasPercent = typeof log.percent === 'number'
+                                // 下載／燒錄期間一律只顯示「更新中」，成功後才顯示「更新完成」
+                                const inProgress = log.action === 'ota_start' || log.action === 'ota_progress'
+                                const displayMsg = inProgress ? '更新中' : (log.message || log.status || '')
+                                statusNode = (
+                                  <div className="flex flex-col gap-1">
+                                    {displayMsg && <div className="truncate">{displayMsg}</div>}
+                                    {hasPercent && (
+                                      <div className="flex items-center gap-2">
+                                        <div className="h-1.5 w-24 overflow-hidden rounded-full bg-slate-700">
+                                          <div
+                                            className="h-full bg-blue-500 transition-all duration-300"
+                                            style={{ width: `${log.percent}%` }}
+                                          />
+                                        </div>
+                                        <span className="text-[10px] text-slate-400">{log.percent}%</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                )
+                              }
                             }
-
-                            if (log.action === 'ota_error' || log.action === 'ui_error' || (typeof log.message === 'string' && /error|失敗|出錯/i.test(log.message))) {
-                              return <span className="text-rose-400">{log.message || log.status || '更新出錯'}</span>
-                            }
-
-                            if (log.action === 'ui_info') {
-                              return <span className="text-blue-400">{log.message}</span>
-                            }
-
-                            if (log.action === 'ota_retry') {
-                              return <span className="text-amber-400">{log.message || '準備重試…'}</span>
-                            }
-
-                            const hasPercent = typeof log.percent === 'number'
-                            // 下載／燒錄期間一律只顯示「更新中」，成功後才顯示「更新完成」
-                            const inProgress = log.action === 'ota_start' || log.action === 'ota_progress'
-                            const displayMsg = inProgress ? '更新中' : (log.message || log.status || '')
 
                             return (
                               <div className="flex flex-col gap-1">
-                                {displayMsg && <div className="truncate">{displayMsg}</div>}
-                                {hasPercent && (
-                                  <div className="flex items-center gap-2">
-                                    <div className="h-1.5 w-24 overflow-hidden rounded-full bg-slate-700">
-                                      <div
-                                        className="h-full bg-blue-500 transition-all duration-300"
-                                        style={{ width: `${log.percent}%` }}
-                                      />
-                                    </div>
-                                    <span className="text-[10px] text-slate-400">{log.percent}%</span>
+                                {statusNode}
+                                {sentVersion ? (
+                                  <div className="text-[11px] text-slate-400">
+                                    版本 <span className="font-mono text-slate-100">{sentVersion}</span>
                                   </div>
-                                )}
+                                ) : null}
                               </div>
                             )
                           })()}
