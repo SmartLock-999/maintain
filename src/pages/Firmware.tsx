@@ -240,19 +240,16 @@ export default function FirmwarePage() {
     [devicesByServer, selectedServerNo],
   )
 
-  const serverVersions = useMemo(
-    () => (selectedServerNo == null ? [] : versions.filter((v) => v.server_no === selectedServerNo)),
-    [versions, selectedServerNo],
-  )
+  // 韌體檔案為所有伺服器共用，不論選擇哪台伺服器都能看到並選用來更新
+  const availableVersions = versions
 
   const selectedVersion = useMemo(
-    () => serverVersions.find((v) => v.id === selectedVersionId) ?? null,
-    [serverVersions, selectedVersionId],
+    () => availableVersions.find((v) => v.id === selectedVersionId) ?? null,
+    [availableVersions, selectedVersionId],
   )
 
-  // 切換伺服器時重置選取
+  // 切換伺服器時重置設備選取（韌體版本為共用，保留選取）
   useEffect(() => {
-    setSelectedVersionId(null)
     setSelectedDeviceIds([])
     setSendMsg(null)
   }, [selectedServerNo])
@@ -672,14 +669,14 @@ export default function FirmwarePage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>版本清單{selectedServerNo == null ? '' : `（Server #${selectedServerNo}）`}</CardTitle>
+            <CardTitle>版本清單（全伺服器共用）</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="max-h-[320px] space-y-2 overflow-auto pr-1">
-              {serverVersions.length === 0 ? (
+              {availableVersions.length === 0 ? (
                 <div className="text-sm text-slate-300">尚無韌體版本</div>
               ) : (
-                serverVersions.map((v) => (
+                availableVersions.map((v) => (
                   <button
                     key={v.id}
                     className={
